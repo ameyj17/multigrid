@@ -1,0 +1,25 @@
+mode: "ppo"
+version: "1.0"
+
+# PPO specific parameters
+ppo_epochs: 4              # Number of epochs to optimize on the same trajectory batch
+clip_param: 0.2            # PPO clipping parameter
+value_loss_coef: 0.5       # Value loss coefficient
+entropy_coef: 0.01         # Entropy coefficient for exploration
+max_grad_norm: 0.5         # Gradient clipping threshold
+gae_lambda: 0.95           # GAE-Lambda parameter
+gamma: 0.99                # Discount factor
+
+# Training parameters
+n_episodes: 100000         # Total number of episodes to train
+batch_size: 64             # Minibatch size for updates
+learning_rate: 3.0e-4      # Learning rate
+num_steps: 2048            # Steps per update (horizon length)
+
+# Network architecture
+hidden_size: 64            # Hidden layer size
+activation: "relu"         # Activation function
+
+# Logging and saving
+save_interval: 10000       # Save model every N episodes
+log_interval: 100          # Log metrics every N episodes 

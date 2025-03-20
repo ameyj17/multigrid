@@ -66,17 +66,20 @@ def generate_parameters(mode, domain, debug=False, seed=None, with_expert=None, 
     # Merge configs
     config_with_domain = merge_configs(config_domain, config_default)
     config = dotdict(merge_configs(config_mode, config_with_domain))
+    print("merge_configs: " + str(config))
 
     if debug:
         # Disable weights and biases logging during debugging
+        print("debug: " + str(type(debug)))
         print('Debug selected, disabling wandb')
         wandb.init(project = wandb_project + '-' + domain, config=config, 
             mode='disabled')
     else:
+        print("Initiating wandb project")
         wandb.init(project = wandb_project + '-' + domain, config=config)
     
     path_configs = {'model_name': config.mode + "_seed_" + str(config.seed) + "_domain_" + config.domain + "_version_" + config.version,
-                    'load_model_path': config.load_model_start_path + "_seed_" + str(config.seed) + "_domain_" + config.domain + "_version_" + config.version,
+                    'load_model_path': (config.load_model_start_path or "") + "_seed_" + str(config.seed) + "_domain_" + config.domain + "_version_" + config.version,
                     'wandb_project': wandb_project + '-' + config.domain}
     wandb.config.update(path_configs)
 
@@ -101,8 +104,8 @@ def generate_parameters(mode, domain, debug=False, seed=None, with_expert=None, 
     return wandb.config
 
 
-def plot_single_frame(frame_id, full_env_image, agents_partial_images, actions, rewards, action_dict,
-                      fig_dir, expt_name, figsize=(10,10), shared_ylim=False, min_ylim=.0001):
+def plot_single_frame(t, full_img, agent_imgs, actions, rewards, action_dict, 
+                      video_path, model_name, predicted_actions=None):
     # Seaborn palette.
     sns.set()
     color_palette = sns.palettes.color_palette()
@@ -115,10 +118,10 @@ def plot_single_frame(frame_id, full_env_image, agents_partial_images, actions, 
 
     # Determine variables
     n_agents = len(actions)
-    max_val = np.max(full_env_image)
+    max_val = np.max(full_img)
 
     # Create figure
-    fig = plt.figure(constrained_layout=True, figsize=figsize)
+    fig = plt.figure(constrained_layout=True, figsize=(10,10))
     total_subplots_horizontal = 2 + n_agents
     total_subplots_vertical = 3
     gs = GridSpec(total_subplots_vertical, total_subplots_horizontal, figure=fig)
@@ -137,13 +140,13 @@ def plot_single_frame(frame_id, full_env_image, agents_partial_images, actions, 
     agent_proportion = 1.0 / total_subplots_horizontal
 
     # Plot shared obervation in top left
-    full_obs_ax.imshow(full_env_image, interpolation='none')
+    full_obs_ax.imshow(full_img, interpolation='none')
     full_obs_ax.set_title('Full environment state')
     full_obs_ax.grid(False)
 
     # Plot individual agents' observations across top right
     for i in range(n_agents):
-        agents_obs_axes[i].imshow(agents_partial_images[i], interpolation='none')
+        agents_obs_axes[i].imshow(agent_imgs[i], interpolation='none')
         agents_obs_axes[i].set_title('Agent' + str(i) + ' partial obs')
         agents_obs_axes[i].grid(False)
 
@@ -152,19 +155,19 @@ def plot_single_frame(frame_id, full_env_image, agents_partial_images, actions, 
     cum_collective_return = np.cumsum(collective_return)
     steps = np.arange(len(cum_collective_return))
     collective_reward_ax.plot(steps, cum_collective_return, color=color_palette[0], lw=linewidth)
-    if frame_id > 0:
-        collective_reward_ax.plot(frame_id, cum_collective_return[frame_id - 1], 'o', ms=ms_current, 
+    if t > 0:
+        collective_reward_ax.plot(t, cum_collective_return[t - 1], 'o', ms=ms_current, 
               mfc=color_palette[0], mew=0)
         
         # Write the reward for previous timestep
-        s = 'R_t={}: {}'.format(frame_id-1, collective_return[frame_id-1])
+        s = 'R_t={}: {}'.format(t-1, collective_return[t-1])
         collective_reward_ax.text(0.1, .85, s, fontsize=10,
                                   horizontalalignment='left', verticalalignment='bottom', transform=collective_reward_ax.transAxes)
     collective_reward_ax.set_xlabel('Step', fontsize=10, labelpad=xlabelpad)
     collective_reward_ax.set_ylabel('Collective return', fontsize=10, labelpad=ylabelpad)
 
     # Write the reward for current timestep
-    s = 'R_t={}: {}'.format(frame_id, collective_return[frame_id])
+    s = 'R_t={}: {}'.format(t, collective_return[t])
     collective_reward_ax.text(0.1, 0.7, s, fontsize=10, 
                               horizontalalignment='left', verticalalignment='bottom', transform=collective_reward_ax.transAxes)
 
@@ -173,8 +176,8 @@ def plot_single_frame(frame_id, full_env_image, agents_partial_images, actions, 
         # Cumulative return graphs across bottom right
         cum_return = np.cumsum(rewards[:,i])
         agents_rewards_axes[i].plot(steps, cum_return, color=color_palette[0], lw=linewidth)
-        if frame_id > 0:
-            agents_rewards_axes[i].plot(frame_id, cum_return[frame_id - 1], 'o', ms=ms_current, mfc=color_palette[0], mew=0)
+        if t > 0:
+            agents_rewards_axes[i].plot(t, cum_return[t - 1], 'o', ms=ms_current, mfc=color_palette[0], mew=0)
         agents_rewards_axes[i].set_xlabel('Step', fontsize=10, labelpad=xlabelpad)
         agents_rewards_axes[i].set_ylabel('Agent' + str(i) + ' return', fontsize=10, labelpad=ylabelpad)
 
@@ -184,28 +187,38 @@ def plot_single_frame(frame_id, full_env_image, agents_partial_images, actions, 
             text_vertical_loc = 0.75
         else:
             text_vertical_loc = 0.65
-        act_text = 'a^{}_t={}: {}'.format(i, frame_id, action_dict[int(actions[i])])  # action
+        act_text = 'a^{}_t={}: {}'.format(i, t, action_dict[int(actions[i])])  # action
         fig.text(text_horizontal_loc, text_vertical_loc, act_text, fontsize=10)
-        r_text = 'R_t={}: {}'.format(frame_id, rewards[frame_id, i])
+        r_text = 'R_t={}: {}'.format(t, rewards[t, i])
         fig.text(text_horizontal_loc, text_vertical_loc-0.1, r_text, fontsize=10)
-        if frame_id > 0:
-            r_prev_text = 'R_t={}: {}'.format(frame_id-1, rewards[frame_id-1, i])
+        if t > 0:
+            r_prev_text = 'R_t={}: {}'.format(t-1, rewards[t-1, i])
             fig.text(text_horizontal_loc, text_vertical_loc-0.05, r_prev_text, fontsize=10)
 
-    filename = '{}_{:05d}.png'.format(expt_name, frame_id)
-    fig_path = os.path.join(fig_dir, filename)
+    filename = '{}_{:05d}.png'.format(model_name, t)
+    fig_path = os.path.join(video_path, filename)
     plt.savefig(fig_path)
     plt.close()
 
 def make_video(video_path, video_name='trajectory_video', frame_rate=10, img_extension='.png'):
+    """Create video from frames with proper error handling"""
     image_files = [os.path.join(video_path, img) for img in os.listdir(video_path) if img.endswith(img_extension)]
     image_files.sort()
-
-    clips = [ImageClip(img).set_duration(1) for img in image_files]
-    concat_clip = concatenate_videoclips(clips, method="compose")
-    concat_clip.write_videofile(os.path.join(video_path, video_name + '.mp4'), fps=frame_rate)
-
-    # Another option: os.system("ffmpeg -r 1 -i img%01d.png -vcodec mpeg4 -y movie.mp4")
+    
+    # Inform user about frame count
+    print(f"Creating video with {len(image_files)} frames")
+    
+    if len(image_files) == 0:
+        print("Warning: No frames found for video creation")
+        return
+    
+    try:
+        clips = [ImageClip(img).set_duration(1/frame_rate) for img in image_files]
+        concat_clip = concatenate_videoclips(clips, method="compose")
+        concat_clip.write_videofile(os.path.join(video_path, video_name + '.mp4'), fps=frame_rate)
+        print(f"Video successfully created: {os.path.join(video_path, video_name + '.mp4')}")
+    except Exception as e:
+        print(f"Error creating video: {e}")
 
 def print_network_params(net):
     for name, p in net.named_parameters(): 

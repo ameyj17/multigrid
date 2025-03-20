@@ -30,7 +30,7 @@ from envs.gym_multigrid import multigrid_envs
 def parse_args():
   parser = argparse.ArgumentParser()
   parser.add_argument(
-      '--env_name', type=str, default='MultiGrid-DoorKey-8x8-v0',
+      '--env_name', type=str, default='MultiGrid-Cluttered-Fixed-15x15',
       help='Name of multi-agent environment.')
   parser.add_argument(
       '--multiple_episodes', type=int, default=100,
@@ -101,6 +101,12 @@ def main(args):
   while True:
     print(env)
     env.render()
+    order_env = gym.wrappers.OrderEnforcing(env)
+    print("env: \n" + str(dir(order_env)))
+    print("action_space:       " + str(type(env.action_space)))
+    print("observation_space:       " + str(env.observation_space))
+    print("reward_space:       " + str(env.reward_range))
+    print("#####################################################")
     actions = get_user_input(env)
     if not actions:
       return
