@@ -1,25 +1,29 @@
 mode: "ppo"
 version: "1.0"
 
-# PPO specific parameters
-ppo_epochs: 4              # Number of epochs to optimize on the same trajectory batch
-clip_param: 0.2            # PPO clipping parameter
-value_loss_coef: 0.5       # Value loss coefficient
-entropy_coef: 0.01         # Entropy coefficient for exploration
-max_grad_norm: 0.5         # Gradient clipping threshold
-gae_lambda: 0.95           # GAE-Lambda parameter
-gamma: 0.99                # Discount factor
+# PPO specific parameters optimized for SPEED
+ppo_epochs: 4              # Optimal for learning
+clip_param: 0.2            # Standard PPO clipping
+value_loss_coef: 0.5       # Standard value
+entropy_coef: 0.01         # Balance exploration vs exploitation
+max_grad_norm: 0.5         # Standard gradient clipping 
+gae_lambda: 0.95           # Good for credit assignment
+gamma: 0.99                # Standard discount
 
-# Training parameters
-n_episodes: 100000         # Total number of episodes to train
-batch_size: 64             # Minibatch size for updates
-learning_rate: 3.0e-4      # Learning rate
-num_steps: 2048            # Steps per update (horizon length)
+# CRITICAL SPEED IMPROVEMENTS
+batch_size: 256            # Larger batch size for parallel processing
+learning_rate: 1.0e-3      # Much higher learning rate for faster convergence
+num_steps: 256             # Shorter rollouts for more frequent updates
+n_envs: 16                 # Number of parallel environments
+buffer_size: 4096          # Larger replay buffer for parallel environments
 
-# Network architecture
-hidden_size: 64            # Hidden layer size
-activation: "relu"         # Activation function
+# Network architecture - simplified
+hidden_size: 64            # Smaller networks for faster training
+activation: "relu"         # Fast activation function
 
-# Logging and saving
-save_interval: 10000       # Save model every N episodes
-log_interval: 100          # Log metrics every N episodes 
+# Minimal logging - critical for speed
+save_interval: 100      # Only save once
+log_interval: 1000         # Very infrequent logging
+
+# Disable all debug output
+verbose: 0

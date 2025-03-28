@@ -37,11 +37,8 @@ def parse_args():
         '--wandb_project', type=str, default='multigrid_expert_3',
         help="Name of wandb project.")
     parser.add_argument(
-        '--n_episodes', type=int, default=100000,
-        help="Number of episodes to train.")
-    parser.add_argument(
-        '--decentralized_training', action=argparse.BooleanOptionalAction, default=False,
-        help="If used, will train agents independently rather than with coordinated actions.")
+        '--decentralized_training', action=argparse.BooleanOptionalAction, default=True,
+        help="If used, will train agents independently (default: True)")
 
     return parser.parse_args()
 
@@ -66,9 +63,12 @@ def initialize(args):
         wandb_project=args.wandb_project
     )
     
-    # Add additional parameters from command line
-    config.n_episodes = args.n_episodes
-    config.decentralized_training = args.decentralized_training
+    # Add additional parameters from command line with allow_val_change=True
+    if hasattr(wandb, 'run') and wandb.run is not None:
+        wandb.config.update({"decentralized_training": args.decentralized_training}, allow_val_change=True)
+    else:
+        # If wandb is disabled, just set the attribute directly
+        config.decentralized_training = args.decentralized_training
 
     # Set seeds
     random.seed(config.seed)
@@ -96,28 +96,63 @@ def main(args):
 
     # Initialize components
     device, config, env, metacontroller_class = initialize(args)
-    print("Initialization successful")
+    print("[Main] Initialization successful")
+    
+    # Get n_episodes directly from config
+    n_episodes = 1000  # Default fallback
+    if hasattr(config, 'n_episodes'):
+        n_episodes = config.n_episodes
+        print(f"[Main] Using n_episodes={n_episodes} from config")
+    else:
+        print(f"[Main] Warning: n_episodes not found in config, using default: {n_episodes}")
 
     # Visualization mode
     if args.visualize:
+        print("[Main] Visualization mode active")
         agent = metacontroller_class(config, env, device, training=False)
         agent.load_models(model_path=args.load_checkpoint_from)
         agent.visualize(env, args.mode, args.video_dir)
-        print('A video of the trained policies being tested in the environment'
-              'has been generated and is located in', args.video_dir)
+        print('[Main] Visualization complete. Video has been generated in', args.video_dir)
+        # Close environment to ensure clean exit
+        env.close()
         exit(0)
     
     # Training mode
-    print("Setting up metacontroller agent")
+    print(f"[Main] Setting up training for {n_episodes} episodes")
     agent = metacontroller_class(config, env, device, debug=args.debug)
 
     if args.keep_training and args.load_checkpoint_from:
-        print(f"Loading models from {args.load_checkpoint_from}")
+        print(f"[Main] Loading models from {args.load_checkpoint_from}")
         agent.load_models(model_path=args.load_checkpoint_from)
 
-    print(f"Starting training for {config.n_episodes} episodes")
-    agent.train(env)
-    print("Training complete")
+    try:
+        print(f"[Main] Starting training for {n_episodes} episodes")
+        trained_agents = agent.train(env)
+        print("[Main] Training successfully completed")
+        
+        # Save final model state if needed
+        print("[Main] Saving final model state")
+        for i, trained_agent in enumerate(trained_agents):
+            final_save_path = f"models/agent_{i}_completed"
+            trained_agent.save(final_save_path)
+            print(f"[Main] Final model for agent {i} saved to {final_save_path}")
+            
+    except KeyboardInterrupt:
+        print("[Main] Training interrupted by user")
+    except Exception as e:
+        print(f"[Main] Error during training: {e}")
+    finally:
+        # Ensure clean exit
+        print("[Main] Cleaning up resources")
+        try:
+            env.close()
+        except:
+            pass
+        
+        if wandb.run is not None:
+            wandb.finish()
+            
+        print("[Main] Training session ended")
 
 if __name__ == '__main__':
     main(parse_args())

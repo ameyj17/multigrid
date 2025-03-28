@@ -68,15 +68,24 @@ def generate_parameters(mode, domain, debug=False, seed=None, with_expert=None, 
     config = dotdict(merge_configs(config_mode, config_with_domain))
     print("merge_configs: " + str(config))
 
+    # Print n_episodes from config - add this for debugging
+    if 'n_episodes' in config:
+        print(f"n_episodes from YAML config: {config['n_episodes']}")
+    else:
+        print("Warning: n_episodes not found in YAML config")
+
+    # Create a wandb config dictionary - DO NOT exclude n_episodes
+    wandb_config_dict = {k: v for k, v in config.items() if k not in ['decentralized_training']}
+    
     if debug:
         # Disable weights and biases logging during debugging
         print("debug: " + str(type(debug)))
         print('Debug selected, disabling wandb')
-        wandb.init(project = wandb_project + '-' + domain, config=config, 
+        wandb.init(project = wandb_project + '-' + domain, config=wandb_config_dict, 
             mode='disabled')
     else:
         print("Initiating wandb project")
-        wandb.init(project = wandb_project + '-' + domain, config=config)
+        wandb.init(project = wandb_project + '-' + domain, config=wandb_config_dict)
     
     path_configs = {'model_name': config.mode + "_seed_" + str(config.seed) + "_domain_" + config.domain + "_version_" + config.version,
                     'load_model_path': (config.load_model_start_path or "") + "_seed_" + str(config.seed) + "_domain_" + config.domain + "_version_" + config.version,
@@ -85,6 +94,11 @@ def generate_parameters(mode, domain, debug=False, seed=None, with_expert=None, 
 
     print("CONFIG")
     print(wandb.config)
+    
+    # Copy over any important config values that may have been lost
+    if 'n_episodes' in config and 'n_episodes' not in wandb.config:
+        wandb.config.update({'n_episodes': config.n_episodes}, allow_val_change=True)
+        print(f"Added n_episodes={config.n_episodes} to wandb.config")
 
     wandb.define_metric("episode/x_axis")
     wandb.define_metric("step/x_axis")
@@ -101,7 +115,9 @@ def generate_parameters(mode, domain, debug=False, seed=None, with_expert=None, 
 
     wandb.run.name = config.model_name
 
-    return wandb.config
+    # Make sure we always return both the wandb config and our original config
+    # Return the original merged config instead of just wandb.config
+    return config
 
 
 def plot_single_frame(t, full_img, agent_imgs, actions, rewards, action_dict, 
