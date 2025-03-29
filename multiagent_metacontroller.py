@@ -390,7 +390,10 @@ class MetaController:
                 vf_coef=self.config.value_loss_coef,
                 max_grad_norm=self.config.max_grad_norm,
                 gae_lambda=self.config.gae_lambda,
-                device=self.device
+                device=self.device,
+                # Additional parameters for better exploration
+                target_kl=self.config.target_kl,  # Target KL divergence to prevent too large policy updates
+                normalize_advantage=True  # Normalize advantages for more stable training
             )
             self.ppo_agents.append(ppo_agent)
         
@@ -436,9 +439,24 @@ class MetaController:
         if visualize:
             viz_data = self._init_visualization_data(env)
             print(f"[MetaController] Visualization enabled for episode {episode}")
+            print(f"[MetaController] Visualization will use deterministic={visualize}")
+            
+        # Add debug prints for model loading status
+        print(f"[MetaController] Agent models loaded status:")
+        for i, agent in enumerate(self.agents):
+            print(f"  Agent {i} loaded: {hasattr(agent, 'policy') and agent.policy is not None}")
         
         # Reset environment
         state = env.reset()
+        
+        # Print initial observation format
+        print(f"[MetaController] Initial state type: {type(state)}")
+        if isinstance(state, dict):
+            print(f"  State keys: {state.keys()}")
+        elif isinstance(state, (list, tuple)):
+            print(f"  State is a list/tuple with {len(state)} elements")
+            if len(state) > 0:
+                print(f"  First element type: {type(state[0])}")
         
         # Initialize episode data
         done = False
@@ -453,23 +471,103 @@ class MetaController:
         # Use save_interval from ppo.yaml if available, or fall back to a default
         save_interval = getattr(self.config, 'save_interval', 10000)
         
-        while not done:
+        # For debugging: force non-deterministic during visualization
+        force_explore = getattr(self.config, 'force_explore', False)
+        if force_explore:
+            print("[MetaController] FORCING EXPLORATION MODE (non-deterministic actions)")
+            
+        # Anti-stuck mechanism
+        MAX_STUCK_STEPS = 5
+        stuck_counter = 0
+        last_actions = None
+        
+        # Increase episode length for both training and visualization
+        MAX_STEPS = 500 if visualize else 1000  # Longer for training, bit shorter for visualization
+        
+        # Track repetitive actions for penalty
+        action_history = [[] for _ in range(self.n_agents)]
+        
+        while not done and steps < MAX_STEPS:
             # Collect all agent actions
             actions = []
             for i in range(self.n_agents):
                 agent = self.agents[i]
                 agent_obs = self.get_agent_obs(state, i)
                 
+                # Debug print for observation format
+                if steps == 0:
+                    print(f"[DEBUG] Agent {i} observation shape/format:")
+                    if isinstance(agent_obs, dict):
+                        for k, v in agent_obs.items():
+                            if isinstance(v, np.ndarray):
+                                print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+                            elif isinstance(v, torch.Tensor):
+                                print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+                            else:
+                                print(f"  {k}: {type(v)}")
+                
                 # For both visualization and training, we'll use the predict method
                 # deterministic=False for training to include exploration
-                deterministic = visualize  # True for visualization, False for training
+                
+                # Anti-stuck mechanism: if repeating the same actions for too long, force exploration
+                if stuck_counter >= MAX_STUCK_STEPS:
+                    deterministic = False
+                    if stuck_counter == MAX_STUCK_STEPS:
+                        print(f"[DEBUG] Detected stuck pattern at step {steps}. Forcing exploration!")
+                else:
+                    # Use deterministic for visualization, non-deterministic for training
+                    deterministic = visualize 
+                
                 with torch.no_grad():
                     action, _ = agent.predict(agent_obs, deterministic=deterministic)
                 
                 actions.append(action)
+                
+                # Store action in history for this agent (for repetitive action penalty)
+                if train:
+                    action_val = action.item() if hasattr(action, 'item') else int(action)
+                    action_history[i].append(action_val)
+                    # Keep only last 10 actions
+                    if len(action_history[i]) > 10:
+                        action_history[i].pop(0)
+            
+            # Check if actions are the same as last step (for stuck detection)
+            current_actions_list = [a.item() if hasattr(a, 'item') else int(a) for a in actions]
+            if last_actions == current_actions_list:
+                stuck_counter += 1
+            else:
+                stuck_counter = 0
+            last_actions = current_actions_list
+            
+            # Debug print for actions
+            if steps % 10 == 0 or steps < 5 or stuck_counter > 0:
+                print(f"[DEBUG] Step {steps} actions: {current_actions_list} {'(Stuck!)' if stuck_counter > 0 else ''}")
             
             # Take a step in the environment
             next_state, reward, done, info = env.step(actions)
+            
+            # Apply repetitive action penalty during training to encourage exploration
+            if train:
+                modified_reward = []
+                for i, r in enumerate(reward if isinstance(reward, (list, tuple)) else [reward] * self.n_agents):
+                    # Check for repetitive actions
+                    if len(action_history[i]) >= 5:
+                        last_5_actions = action_history[i][-5:]
+                        # Count number of movement actions (0=left, 1=right, 2=forward)
+                        movement_count = sum(1 for a in last_5_actions if a in [0, 1, 2])
+                        
+                        # If too few movement actions, apply penalty
+                        if movement_count < 2:  # Less than 2 movement actions in last 5
+                            r -= 0.01  # Small penalty for not moving
+                            
+                        # Check for same action repeated
+                        if len(set(last_5_actions)) == 1:  # Same action repeated 5 times
+                            r -= 0.02  # Larger penalty for repeating exact same action
+                    
+                    modified_reward.append(r)
+                
+                # Replace reward with modified version for training
+                reward = modified_reward if len(modified_reward) > 1 else modified_reward[0]
             
             # Calculate total reward for this step
             step_reward = sum(reward) if isinstance(reward, (list, tuple)) else reward
@@ -477,8 +575,8 @@ class MetaController:
             
             # For visualization purposes
             if visualize:
-                if steps % 50 == 0:  # Less frequent logs for visualization
-                    print(f"[MetaController] Visualization step {steps}: Reward={step_reward:.2f}")
+                if steps % 10 == 0:  # More frequent logs for debugging
+                    print(f"[MetaController] Visualization step {steps}: Actions={current_actions_list}, Reward={step_reward:.2f}")
                 viz_data = self._add_visualization_data(viz_data, env, state, actions, next_state)
                 rewards.append(reward)
             
@@ -504,6 +602,17 @@ class MetaController:
             if done:
                 episode_duration = time.time() - episode_start_time
                 print(f"[MetaController] Episode {episode} completed - {steps} steps, reward: {total_episode_reward:.2f}")
+                # Print final actions summary
+                print(f"[DEBUG] Final episode actions distribution:")
+                action_counts = {}
+                for step_actions in episode_actions:
+                    for i, a in enumerate(step_actions):
+                        a_val = a.item() if hasattr(a, 'item') else int(a)
+                        key = f"agent_{i}_action_{a_val}"
+                        action_counts[key] = action_counts.get(key, 0) + 1
+                for k, v in action_counts.items():
+                    print(f"  {k}: {v} times ({v/steps*100:.1f}%)")
+                
                 if log:
                     self._log_episode(episode, steps, episode_rewards)
                 break
@@ -609,6 +718,9 @@ class MetaController:
                 done = False
                 episode_start_time = time.time()
                 
+                # Initialize tracking for action repetition
+                last_actions = [0] * self.n_agents
+                
                 # Run one episode
                 while not done and episode_step < 500:  # Cap at 500 steps
                     # Get all agents' actions
@@ -628,10 +740,31 @@ class MetaController:
                         actions.append(action)
                     
                     # Step environment with all actions together
-                    next_state, rewards, done, _ = env.step(actions)
+                    next_state, rewards, done, info = env.step(actions)
                     
-                    # Update episode rewards
-                    episode_reward += np.array(rewards) if isinstance(rewards, (list, tuple)) else np.array([rewards] * self.n_agents)
+                    # Apply reward shaping to encourage movement and exploration
+                    shaped_rewards = []
+                    for i, r in enumerate(rewards if isinstance(rewards, (list, tuple)) else [rewards] * self.n_agents):
+                        # Original reward
+                        shaped_r = r
+                        
+                        # Bonus for movement actions
+                        if actions[i] in [0, 1, 2]:  # left, right, forward
+                            shaped_r += 0.01  # Small bonus for movement
+                            
+                        # Penalty for typical "stuck" actions
+                        if actions[i] in [3, 4, 5]:  # pickup, drop, toggle
+                            # Count how many times these actions have been taken
+                            if episode_step > 0 and i < len(last_actions) and last_actions[i] == actions[i]:
+                                shaped_r -= 0.005  # Small penalty for repeating non-movement actions
+                                
+                        shaped_rewards.append(shaped_r)
+                    
+                    # Store last actions for comparison in next step
+                    last_actions = actions.copy()
+                    
+                    # Update episode rewards with shaped rewards
+                    episode_reward += np.array(shaped_rewards) if len(shaped_rewards) > 1 else np.array([shaped_rewards[0]] * self.n_agents)
                     
                     # Update state
                     state = next_state
@@ -869,12 +1002,19 @@ class MetaController:
     def visualize(self, env, mode, video_dir='videos', viz_data=None):
         """Create visualization video"""
         print(f"[MetaController] Starting visualization in {video_dir}")
+        print(f"[MetaController] Model info before visualization:")
+        for i, agent in enumerate(self.agents):
+            print(f"  Agent {i} model type: {type(agent)}")
+            if hasattr(agent, 'policy'):
+                print(f"  Agent {i} policy type: {type(agent.policy)}")
+            
         if not viz_data:
+            print("[MetaController] Running episode for visualization with deterministic=True")
             viz_data = self.run_one_episode(env, episode=0, log=False, train=False, 
                                           save_model=False, visualize=True)
         
         # Set up video directory
-        video_path = os.path.join(video_dir, self.config.experiment_name, self.config.model_name)
+        video_path = os.path.join(video_dir, self.config.domain)
         if not os.path.exists(video_path):
             os.makedirs(video_path)
         print(f"[MetaController] Video will be saved to {video_path}")
@@ -883,14 +1023,44 @@ class MetaController:
         action_dict = {}
         for act in env.Actions:
             action_dict[act.value] = act.name
+        print(f"[MetaController] Action mapping: {action_dict}")
         
         # Create frames
         traj_len = len(viz_data['rewards'])
         print(f"[MetaController] Creating {traj_len} visualization frames")
+        # Print some statistics about actions
+        if 'actions' in viz_data and len(viz_data['actions']) > 0:
+            all_actions = []
+            # Convert numpy arrays to integers before adding to list
+            for step_actions in viz_data['actions']:
+                step_actions_int = []
+                for a in step_actions:
+                    # Convert numpy array to integer if needed
+                    if hasattr(a, 'item'):
+                        step_actions_int.append(a.item())
+                    else:
+                        step_actions_int.append(int(a))
+                all_actions.extend(step_actions_int)
+            
+            action_freq = {}
+            for a in all_actions:
+                action_freq[a] = action_freq.get(a, 0) + 1
+            print(f"[MetaController] Action frequency in trajectory: {action_freq}")
+        
         for t in range(traj_len):
             self._visualize_frame(t, viz_data, action_dict, video_path)
             if t % 25 == 0:
                 print(f"[MetaController] Creating frame {t}/{traj_len}")
+                if t > 0:
+                    # Convert numpy arrays to integers for printing
+                    actions_to_print = []
+                    for a in viz_data['actions'][t-1]:
+                        if hasattr(a, 'item'):
+                            actions_to_print.append(a.item())
+                        else:
+                            actions_to_print.append(int(a))
+                    print(f"  Actions at this step: {actions_to_print}")
+                    print(f"  Rewards at this step: {viz_data['rewards'][t-1]}")
         
         # Create video
         video_name = f'{mode}_trajectory_video'
@@ -908,7 +1078,14 @@ class MetaController:
 
     def _add_visualization_data(self, viz_data, env, state, actions, next_state):
         """Add frame data to visualization"""
-        viz_data['actions'].append(actions)
+        # Convert numpy arrays to integers before storing
+        actions_int = []
+        for a in actions:
+            if hasattr(a, 'item'):
+                actions_int.append(a.item())
+            else:
+                actions_int.append(int(a))
+        viz_data['actions'].append(actions_int)
         
         # Process agent observations for visualization
         agent_images = []
