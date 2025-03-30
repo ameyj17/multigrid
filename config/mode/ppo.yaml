@@ -1,0 +1,19 @@
+mode: "ppo"
+buffer_size: 2048
+
+# PPO Configuration Parameters
+gamma: 0.99           # Discount factor for future rewards
+n_steps: 2048         # Steps per update batch
+ent_coef: 0.01        # Entropy coefficient for exploration
+learning_rate: 3e-4   # Learning rate for optimizer
+vf_coef: 0.5          # Value function loss coefficient
+max_grad_norm: 0.5    # Gradient clipping threshold
+gae_lambda: 0.95      # GAE smoothing parameter
+n_epochs: 10          # Training epochs per update
+clip_range: 0.2       # PPO clipping parameter for trust region
+batch_size: 64        # Minibatch size for updates
+
+# policy_type: "custom_multigrid"  #'sb3_multi_input' or 'custom_multigrid'
+
+seed: 42
+verbose: 1

@@ -16,7 +16,8 @@ metacontroller: 'multiagent'
 batch_size: 256
 lr: 0.001
 n_episodes: 50000
-update_every: 50
+#update_every: 50
+update_every: 2048
 
 # Logistics params
 save_model_episode: 10000
@@ -36,3 +37,5 @@ cumulants: 64
 filters: 32
 kernel_size: 3
 fc: 256
+
+load_model_start_path: './models/'
