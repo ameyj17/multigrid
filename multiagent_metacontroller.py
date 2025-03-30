@@ -28,7 +28,8 @@ from gymnasium import spaces as gymnasium_spaces
 class GymToGymnasiumDictWrapper(gym.Wrapper):
     """
     Converts an old Gym environment with `gym.spaces.Dict` observation space
-    to use `gymnasium.spaces.Dict`, making it compatible with Stable-Baselines3.
+    to use `gymnasium.spaces.Dict`, making it compatible with Stable-Baselines3. 
+    alternative wrapper: gymnasium.env 
     """
     def __init__(self, env):
         super().__init__(env)
@@ -423,7 +424,7 @@ class MultiAgentPPOController():
 # Notes on implementing CustomMultiGridPolicy
 # ==========================================================================
 """
-Implementing CustomMultiGridPolicy is more complex and requires several additional components:
+Implementing CustomMultiGridPolicy is a bit complex and requires several additional components:
 
 1. **Custom Network Architecture**:
    - Create a specialized CNN for processing small grid-world observations
