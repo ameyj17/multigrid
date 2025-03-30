@@ -9,6 +9,8 @@ import seaborn as sns
 import torch
 import wandb
 import yaml
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 
 class dotdict(dict):
     """dot.notation access to dictionary attributes"""
@@ -120,101 +122,111 @@ def generate_parameters(mode, domain, debug=False, seed=None, with_expert=None, 
     return config
 
 
-def plot_single_frame(t, full_img, agent_imgs, actions, rewards, action_dict, 
-                      video_path, model_name, predicted_actions=None):
-    # Seaborn palette.
-    sns.set()
-    color_palette = sns.palettes.color_palette()
-
-    # Hardcoded plot settings
-    linewidth = 1.25
-    ms_current = 9
-    xlabelpad = 9
-    ylabelpad = 10
-
-    # Determine variables
-    n_agents = len(actions)
-    max_val = np.max(full_img)
-
-    # Create figure
-    fig = plt.figure(constrained_layout=True, figsize=(10,10))
-    total_subplots_horizontal = 2 + n_agents
-    total_subplots_vertical = 3
-    gs = GridSpec(total_subplots_vertical, total_subplots_horizontal, figure=fig)
-     
-    # Create sub plots as grid
-    full_obs_ax = fig.add_subplot(gs[:2, :2])  # Overall view fig is 2x2 (larger)
-    collective_reward_ax = fig.add_subplot(gs[2,:2]) 
-    agents_obs_axes = []
-    agents_rewards_axes = []
-    for i in range(n_agents):
-        agents_obs_axes.append(fig.add_subplot(gs[0, i+2]))
-        agents_rewards_axes.append(fig.add_subplot(gs[2, i+2]))
-
-    # Determine grid proportions
-    full_obs_proportion = 2.0 / total_subplots_horizontal
-    agent_proportion = 1.0 / total_subplots_horizontal
-
-    # Plot shared obervation in top left
-    full_obs_ax.imshow(full_img, interpolation='none')
-    full_obs_ax.set_title('Full environment state')
-    full_obs_ax.grid(False)
-
-    # Plot individual agents' observations across top right
-    for i in range(n_agents):
-        agents_obs_axes[i].imshow(agent_imgs[i], interpolation='none')
-        agents_obs_axes[i].set_title('Agent' + str(i) + ' partial obs')
-        agents_obs_axes[i].grid(False)
-
-    # Plot collective return bottom left
-    collective_return = np.sum(rewards,axis=1)
-    cum_collective_return = np.cumsum(collective_return)
-    steps = np.arange(len(cum_collective_return))
-    collective_reward_ax.plot(steps, cum_collective_return, color=color_palette[0], lw=linewidth)
-    if t > 0:
-        collective_reward_ax.plot(t, cum_collective_return[t - 1], 'o', ms=ms_current, 
-              mfc=color_palette[0], mew=0)
+def plot_single_frame(t, full_image, agents_partial_images, actions, rewards, action_dict, video_path, model_name, predicted_actions=None):
+    """
+    Plot a single frame of the trajectory visualization.
+    """
+    try:
+        # Create a new figure
+        plt.figure(figsize=(12, 8))
         
-        # Write the reward for previous timestep
-        s = 'R_t={}: {}'.format(t-1, collective_return[t-1])
-        collective_reward_ax.text(0.1, .85, s, fontsize=10,
+        # Seaborn palette.
+        sns.set()
+        color_palette = sns.palettes.color_palette()
+
+        # Hardcoded plot settings
+        linewidth = 1.25
+        ms_current = 9
+        xlabelpad = 9
+        ylabelpad = 10
+
+        # Determine variables
+        n_agents = len(actions)
+        max_val = np.max(full_image)
+
+        # Create figure
+        fig = plt.figure(constrained_layout=True, figsize=(10,10))
+        total_subplots_horizontal = 2 + n_agents
+        total_subplots_vertical = 3
+        gs = GridSpec(total_subplots_vertical, total_subplots_horizontal, figure=fig)
+         
+        # Create sub plots as grid
+        full_obs_ax = fig.add_subplot(gs[:2, :2])  # Overall view fig is 2x2 (larger)
+        collective_reward_ax = fig.add_subplot(gs[2,:2]) 
+        agents_obs_axes = []
+        agents_rewards_axes = []
+        for i in range(n_agents):
+            agents_obs_axes.append(fig.add_subplot(gs[0, i+2]))
+            agents_rewards_axes.append(fig.add_subplot(gs[2, i+2]))
+
+        # Determine grid proportions
+        full_obs_proportion = 2.0 / total_subplots_horizontal
+        agent_proportion = 1.0 / total_subplots_horizontal
+
+        # Plot shared obervation in top left
+        full_obs_ax.imshow(full_image, interpolation='none')
+        full_obs_ax.set_title('Full environment state')
+        full_obs_ax.grid(False)
+
+        # Plot individual agents' observations across top right
+        for i in range(n_agents):
+            agents_obs_axes[i].imshow(agents_partial_images[i], interpolation='none')
+            agents_obs_axes[i].set_title('Agent' + str(i) + ' partial obs')
+            agents_obs_axes[i].grid(False)
+
+        # Plot collective return bottom left
+        collective_return = np.sum(rewards,axis=1)
+        cum_collective_return = np.cumsum(collective_return)
+        steps = np.arange(len(cum_collective_return))
+        collective_reward_ax.plot(steps, cum_collective_return, color=color_palette[0], lw=linewidth)
+        if t > 0:
+            collective_reward_ax.plot(t, cum_collective_return[t - 1], 'o', ms=ms_current, 
+                  mfc=color_palette[0], mew=0)
+            
+            # Write the reward for previous timestep
+            s = 'R_t={}: {}'.format(t-1, collective_return[t-1])
+            collective_reward_ax.text(0.1, .85, s, fontsize=10,
+                                      horizontalalignment='left', verticalalignment='bottom', transform=collective_reward_ax.transAxes)
+        collective_reward_ax.set_xlabel('Step', fontsize=10, labelpad=xlabelpad)
+        collective_reward_ax.set_ylabel('Collective return', fontsize=10, labelpad=ylabelpad)
+
+        # Write the reward for current timestep
+        s = 'R_t={}: {}'.format(t, collective_return[t])
+        collective_reward_ax.text(0.1, 0.7, s, fontsize=10, 
                                   horizontalalignment='left', verticalalignment='bottom', transform=collective_reward_ax.transAxes)
-    collective_reward_ax.set_xlabel('Step', fontsize=10, labelpad=xlabelpad)
-    collective_reward_ax.set_ylabel('Collective return', fontsize=10, labelpad=ylabelpad)
 
-    # Write the reward for current timestep
-    s = 'R_t={}: {}'.format(t, collective_return[t])
-    collective_reward_ax.text(0.1, 0.7, s, fontsize=10, 
-                              horizontalalignment='left', verticalalignment='bottom', transform=collective_reward_ax.transAxes)
+        # Plot individual agent returns and actions
+        for i in range(n_agents):
+            # Cumulative return graphs across bottom right
+            cum_return = np.cumsum(rewards[:,i])
+            agents_rewards_axes[i].plot(steps, cum_return, color=color_palette[0], lw=linewidth)
+            if t > 0:
+                agents_rewards_axes[i].plot(t, cum_return[t - 1], 'o', ms=ms_current, mfc=color_palette[0], mew=0)
+            agents_rewards_axes[i].set_xlabel('Step', fontsize=10, labelpad=xlabelpad)
+            agents_rewards_axes[i].set_ylabel('Agent' + str(i) + ' return', fontsize=10, labelpad=ylabelpad)
 
-    # Plot individual agent returns and actions
-    for i in range(n_agents):
-        # Cumulative return graphs across bottom right
-        cum_return = np.cumsum(rewards[:,i])
-        agents_rewards_axes[i].plot(steps, cum_return, color=color_palette[0], lw=linewidth)
-        if t > 0:
-            agents_rewards_axes[i].plot(t, cum_return[t - 1], 'o', ms=ms_current, mfc=color_palette[0], mew=0)
-        agents_rewards_axes[i].set_xlabel('Step', fontsize=10, labelpad=xlabelpad)
-        agents_rewards_axes[i].set_ylabel('Agent' + str(i) + ' return', fontsize=10, labelpad=ylabelpad)
+            # Write the current action and rewards in the space between subplots
+            text_horizontal_loc = full_obs_proportion + agent_proportion * i + agent_proportion * 0.2
+            if predicted_actions is not None:
+                text_vertical_loc = 0.75
+            else:
+                text_vertical_loc = 0.65
+            act_text = 'a^{}_t={}: {}'.format(i, t, action_dict[int(actions[i])])  # action
+            fig.text(text_horizontal_loc, text_vertical_loc, act_text, fontsize=10)
+            r_text = 'R_t={}: {}'.format(t, rewards[t, i])
+            fig.text(text_horizontal_loc, text_vertical_loc-0.1, r_text, fontsize=10)
+            if t > 0:
+                r_prev_text = 'R_t={}: {}'.format(t-1, rewards[t-1, i])
+                fig.text(text_horizontal_loc, text_vertical_loc-0.05, r_prev_text, fontsize=10)
 
-        # Write the current action and rewards in the space between subplots
-        text_horizontal_loc = full_obs_proportion + agent_proportion * i + agent_proportion * 0.2
-        if predicted_actions is not None:
-            text_vertical_loc = 0.75
-        else:
-            text_vertical_loc = 0.65
-        act_text = 'a^{}_t={}: {}'.format(i, t, action_dict[int(actions[i])])  # action
-        fig.text(text_horizontal_loc, text_vertical_loc, act_text, fontsize=10)
-        r_text = 'R_t={}: {}'.format(t, rewards[t, i])
-        fig.text(text_horizontal_loc, text_vertical_loc-0.1, r_text, fontsize=10)
-        if t > 0:
-            r_prev_text = 'R_t={}: {}'.format(t-1, rewards[t-1, i])
-            fig.text(text_horizontal_loc, text_vertical_loc-0.05, r_prev_text, fontsize=10)
-
-    filename = '{}_{:05d}.png'.format(model_name, t)
-    fig_path = os.path.join(video_path, filename)
-    plt.savefig(fig_path)
-    plt.close()
+        filename = '{}_{:05d}.png'.format(model_name, t)
+        fig_path = os.path.join(video_path, filename)
+        plt.savefig(fig_path)
+        plt.close()
+    except Exception as e:
+        print(f"Error in plot_single_frame for frame {t}: {e}")
+        # Make sure to close any open figures even if an error occurs
+        plt.close('all')
 
 def make_video(video_path, video_name='trajectory_video', frame_rate=10, img_extension='.png'):
     """Create video from frames with proper error handling"""

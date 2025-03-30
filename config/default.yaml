@@ -1,23 +1,31 @@
 seed: 1
 
-# Default number of episodes
-n_episodes: 50000
-
 # RL params
 gamma: 0.99
-initial_memory: 2048
+rl_test_episodes: 100000
+eps_start: 1.0
+eps_end: 0.02
+eps_decay: 500000
+target_update: 1000
+initial_memory: 2000
+memory_size: 5000000  # 100000 and 1000000 did not work well
 n_actions: 7
 metacontroller: 'multiagent'
 
 # Learning params
 batch_size: 256
 lr: 0.001
-update_every: 10000
+n_episodes: 50000
+#update_every: 50
+update_every: 2048
 
 # Logistics params
 save_model_episode: 10000
-log_episode: 100
+visualize_every: 10000  # how many episodes before making a video
+log_episode: 500
+log_step: 1000
 version: "default"
+print_every: 10
 base_save_path: ''
 
 # Loss weights
@@ -29,3 +37,5 @@ cumulants: 64
 filters: 32
 kernel_size: 3
 fc: 256
+
+load_model_start_path: './models/'

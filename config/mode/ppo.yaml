@@ -1,29 +1,19 @@
 mode: "ppo"
-version: "1.0"
+buffer_size: 2048
 
-# PPO specific parameters optimized for SPEED
-ppo_epochs: 8              # Optimal for learning
-clip_param: 0.2            # Standard PPO clipping
-value_loss_coef: 0.5       # Standard value
-entropy_coef: 0.05         # Balance exploration vs exploitation
-max_grad_norm: 0.5         # Standard gradient clipping 
-gae_lambda: 0.95           # Good for credit assignment
-gamma: 0.99                # Standard discount
+# PPO Configuration Parameters
+gamma: 0.99           # Discount factor for future rewards
+n_steps: 2048         # Steps per update batch
+ent_coef: 0.01        # Entropy coefficient for exploration
+learning_rate: 3e-4   # Learning rate for optimizer
+vf_coef: 0.5          # Value function loss coefficient
+max_grad_norm: 0.5    # Gradient clipping threshold
+gae_lambda: 0.95      # GAE smoothing parameter
+n_epochs: 10          # Training epochs per update
+clip_range: 0.2       # PPO clipping parameter for trust region
+batch_size: 64        # Minibatch size for updates
 
-# CRITICAL SPEED IMPROVEMENTS
-batch_size: 256            # Larger batch size for parallel processing
-learning_rate: 1.0e-3      # Much higher learning rate for faster convergence
-num_steps: 256             # Shorter rollouts for more frequent updates
-n_envs: 16                 # Number of parallel environments
-buffer_size: 4096          # Larger replay buffer for parallel environments
-target_kl: 0.03
-# Network architecture - simplified
-hidden_size: 64            # Smaller networks for faster training
-activation: "relu"         # Fast activation function
+# policy_type: "custom_multigrid"  #'sb3_multi_input' or 'custom_multigrid'
 
-# Minimal logging - critical for speed
-save_interval: 100      # Only save once
-log_interval: 1000         # Very infrequent logging
-
-# Disable all debug output
-verbose: 0
+seed: 42
+verbose: 1

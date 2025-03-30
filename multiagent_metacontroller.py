@@ -1,5 +1,6 @@
 from copy import deepcopy
 import gym
+import gymnasium
 from itertools import count
 import math
 import matplotlib.pyplot as plt
@@ -12,1137 +13,570 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.nn as nn
 import wandb
-from typing import Dict, List, Tuple, Optional, Type, Union
-from stable_baselines3 import PPO
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.torch_layers import CombinedExtractor, BaseFeaturesExtractor
-from gym import spaces
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import BaseCallback
-import time 
-# Add this import for utils
-import utils
+
+# CustomMultiGridPolicy is intentionally not imported - see end of file for implementation notes
+# from networks.multigrid_network import CustomMultiGridPolicy 
 
 from utils import plot_single_frame, make_video, extract_mode_from_path
-from networks.multigrid_network import MultiGridNetwork
 
-class DictFeaturesExtractor(BaseFeaturesExtractor):
-    """Feature extractor that passes dict observations directly to the policy network"""
+from stable_baselines3 import PPO
+from stable_baselines3.common.buffers import RolloutBuffer
+from stable_baselines3.common.logger import configure
+from stable_baselines3.common.buffers import DictRolloutBuffer # Keep for commented line below
+from stable_baselines3.common.vec_env import DummyVecEnv, VecEnv
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+# Import the shimmy compatibility wrapper
+import shimmy
+
+from gym import spaces as gym_spaces
+from gymnasium import spaces as gymnasium_spaces
+
+# Add SingleAgentObsWrapper for custom_multigrid policy
+# This wrapper is not used in the current simplified implementation
+# See notes at end of file for CustomMultiGridPolicy implementation details
+"""
+class SingleAgentObsWrapper(gymnasium.ObservationWrapper):
+    # Wrapper that modifies the observation space reported by a Dict environment
+    # to represent a single agent's view, assuming the 'image' key holds
+    # the multi-agent observation [N, H, W, C]. 
+    # Not used in this simplified implementation.
+"""
+
+# Add a proper Gymnasium adapter that directly inherits from Env
+class GymToGymnasiumAdapter(gymnasium.Env):
+    """Direct adapter from Gym to Gymnasium."""
     
-    def __init__(self, observation_space, features_dim=1):
-        print(f"DictFeaturesExtractor initialized with observation space: {observation_space}")  # Print observation space
-        super().__init__(observation_space, features_dim)
+    def __init__(self, gym_env):
+        super().__init__()
+        self.gym_env = gym_env
+        self.n_agents = getattr(gym_env, 'n_agents', 1)  # Pass through n_agents for multi-agent envs
         
-    def forward(self, observations):
-        """Extract tensors from the observations dictionary"""
-        print("[DictFeaturesExtractor] observations: ", observations)
-
-        # Extracting the tensors directly
-        direction_tensor = observations['direction']  # Shape: (1, 1)
-        image_tensor = observations['image']          # Shape: (1, 3, 5, 5)
-        other_actions_tensor = observations['other_actions']  # Shape: (1, 2)
-
-        # Ensure direction_tensor has the correct dimensions
-        if direction_tensor.dim() == 2:  # If it's (1, 1)
-            direction_tensor = direction_tensor.unsqueeze(2).unsqueeze(3)  # Shape: (1, 1, 1, 1)
-
-        # Now expand direction_tensor to match the image_tensor's dimensions
-        direction_tensor = direction_tensor.expand(-1, -1, image_tensor.size(2), image_tensor.size(3))  # Shape: (1, 1, 5, 5)
-
-        # Now concatenate along the appropriate dimension (e.g., channels)
-        combined_tensor = torch.cat((image_tensor, direction_tensor), dim=1)  # Shape: (1, 4, 5, 5)
-        print("[DictFeaturesExctractor] combined_tensor:  " + str(combined_tensor.shape))
-
-        return combined_tensor  # Return the combined tensor
-
-class CustomPolicy(ActorCriticPolicy):
-    """Custom policy that uses MultiGridNetwork for both actor and critic"""
-    def __init__(self, observation_space, action_space, lr_schedule, config, n_agents, agent_id, **kwargs):
-        # Use our custom features extractor
-        kwargs["features_extractor_class"] = DictFeaturesExtractor
-        
-        # Initialize with minimal parameters
-        super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            # Skip default network architecture since we'll use MultiGridNetwork
-            net_arch=None,
-            activation_fn=torch.nn.ReLU,
-            **kwargs
-        )
-        # Create actor network (policy)
-        self.actor_net = MultiGridNetwork(
-            observation_space,
-            config,
-            int(np.prod(action_space.shape)),  # Changed to match discrete actions
-            n_agents,
-            agent_id
-        )
-        
-        # Create critic network (value function)
-        self.critic_net = MultiGridNetwork(
-            observation_space,
-            config,
-            1,  # Value function has only one output
-            n_agents,
-            agent_id
-        )
-        
-        # Override the policy forward method to handle dict observations
-        self._policy_forward = self._policy_forward_dict
-        self.process_observation = self.process_observation_dict
-        
-    def process_observation_dict(self, obs):
-        """Process dictionary observations to ensure they're tensors"""
-        return obs
-
-    def _policy_forward_dict(self, obs_dict):
-        """Custom forward pass for the policy to handle dictionary observations"""
-        return self.actor_net(obs_dict)
-    
-    def predict_values(self, obs):
-        """Override predict_values to use our custom critic network"""
-        obs = self.process_observation(obs)
-        values = self.critic_net(obs)
-        return values
-    
-    def evaluate_actions(self, obs, actions):
-        """
-        Override evaluate_actions to use our custom actor and critic networks
-        
-        Args:
-            obs: Observation from the environment
-            actions: Actions whose value and log probability we want to compute
-            
-        Returns:
-            values: Value function predictions
-            log_probs: Log probabilities of the actions
-            entropy: Entropy of the action distribution
-        """
-        obs = self.process_observation(obs)
-        
-        # Get action logits from the actor network
-        action_logits = self.actor_net(obs)
-        
-        # Create distribution
-        distribution = self.action_dist.proba_distribution(action_logits=action_logits)
-        
-        # Get log probabilities
-        log_prob = distribution.log_prob(actions)
-        
-        # Get entropy
-        entropy = distribution.entropy()
-        
-        # Get values from critic network
-        values = self.critic_net(obs)
-        
-        return values, log_prob, entropy
-    
-    def forward(self, obs):
-        """Forward pass in all the networks (actor and critic)"""
-        obs = self.process_observation(obs)  # Ensure obs is processed
-
-        # Run the observation through the actor network to get action logits
-        actor_features = self.actor_net(obs)
-        
-        # Create categorical distribution directly with logits
-        distribution = self.action_dist.proba_distribution(action_logits=actor_features)
-        
-        # Sample an action
-        actions = distribution.get_actions()
-        log_probs = distribution.log_prob(actions)
-        
-        # Get values from critic network
-        critic_features = self.critic_net(obs)
-        values = critic_features
-        
-        return actions, values, log_probs
-    
-    def predict(self, observation, state=None, episode_start=None, deterministic=False):
-        """Override the default predict method to handle our specific action shape"""
-        observation = self.process_observation(observation)
-        with torch.no_grad():
-            action_logits = self.actor_net(observation)
-            
-            # For deterministic policy, simply take the action with highest logit
-            if isinstance(action_logits, torch.Tensor):
-                actions = torch.argmax(action_logits[:7]).cpu().numpy()  # Only consider first 7 actions (0-6)
-            else:
-                # Fallback for unexpected output
-                actions = np.array(0)
-        
-        return actions, None
-class MultiAgentToSingleAgentWrapper(gym.Wrapper):
-    """Wrapper that converts multi-agent environment to single-agent for one agent."""
-    
-    def __init__(self, env, agent_id=0):
-        super().__init__(env)
-        self.agent_id = agent_id
-        self.n_agents = getattr(env, 'n_agents', 3)  # Default to 3 if not specified
-        
-        # Initialize last_actions with zeros
-        self.last_actions = [0] * self.n_agents
-        
-        # Define the action space for this agent
-        self.action_space = spaces.Discrete(7)  # MultiGrid has 7 actions
-        
-        # Set up the observation space for this agent
-        if hasattr(env, 'observation_space') and isinstance(env.observation_space, spaces.Dict):
-            self.observation_space = env.observation_space
-        else:
-            # Default observation space structure for MultiGrid
-            self.observation_space = spaces.Dict({
-                'image': spaces.Box(
-                    low=0, 
-                    high=255, 
-                    shape=(3, 5, 5, 3),  # Channel-first format for SB3
-                    dtype=np.uint8
-                ),
-                'direction': spaces.Box(
-                    low=0,
-                    high=3,
-                    shape=(3,),
-                    dtype=np.uint8
-                )
+        # Convert observation space
+        if isinstance(gym_env.observation_space, gym_spaces.Dict):
+            self.observation_space = gymnasium_spaces.Dict({
+                k: self._convert_space(v) for k, v in gym_env.observation_space.spaces.items()
             })
+        else:
+            self.observation_space = self._convert_space(gym_env.observation_space)
         
-        # Print spaces for debugging
-        print(f"  Action space: {self.action_space}")
-        print(f"  Observation space: {self.observation_space}")
-        print(f"Initialized wrapper for agent {self.agent_id}")
+        # Convert action space
+        self.action_space = self._convert_space(gym_env.action_space)
         
-    def reset(self):
-        """Reset the environment and return the observation for this agent."""
-        obs = self.env.reset()
-        # Reset last_actions to zeros
-        self.last_actions = [0] * self.n_agents
-        # Get this agent's observation
-        agent_obs = self.get_agent_obs(obs, self.agent_id)
-        return agent_obs
+        # Add any other attributes we need to access directly
+        self._gym_env_attrs = {}
+        for attr in ['get_obs_render', 'Actions', 'render', 'close']:
+            if hasattr(gym_env, attr):
+                self._gym_env_attrs[attr] = getattr(gym_env, attr)
     
-    def get_agent_obs(self, obs, agent_id):
-        """Extract observation for a specific agent from the environment observation."""
-        # Handle different observation structures
-        if isinstance(obs, dict):
-            # If observations are already structured by agent
-            if 'image' in obs and isinstance(obs['image'], np.ndarray):
-                # If image is a single array for all agents, we need to process it
-                if len(obs['image'].shape) == 4 and obs['image'].shape[0] == self.n_agents:
-                    # If dimensions are (n_agents, height, width, channels)
-                    image = obs['image'][agent_id]
-                else:
-                    # Otherwise assume the image is already for this agent
-                    image = obs['image']
-                
-                # Convert image from (H, W, C) to (C, H, W) for SB3
-                if len(image.shape) == 3 and image.shape[2] == 3:  # If shape is (H, W, C)
-                    image = np.transpose(image, (2, 0, 1))  # Convert to (C, H, W)
-                
-                # For direction, ensure it's the right agent's direction
-                if 'direction' in obs and isinstance(obs['direction'], np.ndarray):
-                    if len(obs['direction'].shape) > 1 and obs['direction'].shape[0] == self.n_agents:
-                        direction = obs['direction'][agent_id]
-                    else:
-                        direction = obs['direction']
-                else:
-                    direction = np.zeros(3, dtype=np.uint8)  # Default direction
-                
-                return {
-                    'image': image,
-                    'direction': direction
-                }
+    def _convert_space(self, space):
+        """Convert gym space to gymnasium space."""
+        if isinstance(space, gym_spaces.Box):
+            return gymnasium_spaces.Box(low=space.low, high=space.high, 
+                                      shape=space.shape, dtype=space.dtype)
+        elif isinstance(space, gym_spaces.Discrete):
+            return gymnasium_spaces.Discrete(n=space.n)
+        elif isinstance(space, gym_spaces.Tuple):
+            return gymnasium_spaces.Tuple(
+                tuple(self._convert_space(s) for s in space.spaces))
+        elif isinstance(space, gym_spaces.Dict):
+            return gymnasium_spaces.Dict(
+                {k: self._convert_space(s) for k, s in space.spaces.items()})
+        else:
+            # For any other space type, try to pass through
+            return space
+    
+    def reset(self, seed=None, options=None):
+        """Reset environment."""
+        if seed is not None:
+            # Try to set seed if available in gym env
+            try:
+                self.gym_env.seed(seed)
+            except (AttributeError, TypeError):
+                pass
         
-        # Fallback: return a structured observation with defaults
-        return {
-            'image': np.zeros((3, 5, 5, 3), dtype=np.uint8),  # Channel-first empty image
-            'direction': np.zeros(3, dtype=np.uint8)  # Default direction
-        }
+        # Call gym env reset with appropriate kwargs
+        if options is not None:
+            obs = self.gym_env.reset(**options)
+        else:
+            obs = self.gym_env.reset()
+        
+        return obs, {}  # Add empty info dict for gymnasium API
     
     def step(self, action):
-        """
-        Take a step in the environment with the given action for this agent only.
-        """
-        # Ensure action is an integer in the valid range
-        if isinstance(action, np.ndarray):
-            action = action.item()
+        """Step environment."""
+        # Convert action if needed - For multi-agent envs, need special handling
+        # VecEnv will likely pass a single integer or list with one element, 
+        # but our original env expects a list with actions for all agents
+        action_to_pass = action
+        if getattr(self.gym_env, 'n_agents', 1) > 1:
+            # If we get a single action (from vectorized env), duplicate it for all agents
+            if not isinstance(action, (list, tuple, np.ndarray)) or len(action) == 1:
+                if isinstance(action, (list, tuple, np.ndarray)) and len(action) == 1:
+                    action_value = action[0]  # Extract from list with one element
+                else:
+                    action_value = action  # Use as is
+                action_to_pass = [action_value] * self.n_agents
         
-        # Ensure action is within valid range for MultiGrid (0-6)
-        action = int(action) % 7
+        # Call gym env step
+        try:
+            if getattr(self, '_just_reset', False):
+                obs = self.gym_env.reset()
+                reward = 0.0
+                done = False
+                info = {}
+                self._just_reset = False
+            else:
+                obs, reward, done, info = self.gym_env.step(action_to_pass)
+        except Exception as e:
+            print(f"Original env step error: {e}")
+            # Provide fallback values
+            obs = None
+            reward = 0.0
+            done = True
+            info = {}
         
-        # Update this agent's action in the full action list
-        self.last_actions[self.agent_id] = action
+        # Convert to gymnasium API
+        terminated = done
+        truncated = info.get('TimeLimit.truncated', False)
         
-        # Execute the step with all actions
-        next_obs, rewards, done, info = self.env.step(self.last_actions)
-        
-        # Get this agent's observation and reward
-        agent_obs = self.get_agent_obs(next_obs, self.agent_id)
-        
-        if isinstance(rewards, (list, tuple)) and len(rewards) > self.agent_id:
-            reward = rewards[self.agent_id]
-        else:
-            reward = rewards
-        
-        return agent_obs, reward, done, info
+        return obs, reward, terminated, truncated, info
+    
+    def render(self, mode='human'):
+        """Render environment."""
+        # Forward to gym env render
+        render_fn = self._gym_env_attrs.get('render', None)
+        if render_fn is not None:
+            return render_fn(mode)
+        return None
+    
+    def close(self):
+        """Close environment."""
+        if hasattr(self.gym_env, 'close'):
+            return self.gym_env.close()
+    
+    def get_obs_render(self, obs):
+        """Forward get_obs_render if available."""
+        render_fn = self._gym_env_attrs.get('get_obs_render', None)
+        if render_fn is not None:
+            return render_fn(obs)
+        return None
+    
+    def __getattr__(self, name):
+        """Forward attribute access to gym_env for any other attributes."""
+        if name in self._gym_env_attrs:
+            return self._gym_env_attrs[name]
+        raise AttributeError(f"{self.__class__.__name__} has no attribute '{name}'")
 
-class MetaController:
-    """Coordinates multiple PPO agents with the multigrid environment"""
-    def __init__(self, config, env, device, training=True, debug=False):
-        """Initialize metacontroller for MultiGrid environment"""
+
+class GymToGymnasiumDictWrapper(gym.Wrapper):
+    """Converts Gym Dict spaces/API to Gymnasium format."""
+    def __init__(self, env):
+        super().__init__(env)
+        assert isinstance(env.observation_space, gym_spaces.Dict), "Requires Dict obs space."
+        self.observation_space = gymnasium_spaces.Dict({
+            key: self._convert_space(space) for key, space in env.observation_space.spaces.items()
+        })
+        self.action_space = self._convert_space(env.action_space)
+
+    def _convert_space(self, space):
+        if isinstance(space, gym_spaces.Box): return gymnasium_spaces.Box(low=space.low, high=space.high, shape=space.shape, dtype=space.dtype)
+        elif isinstance(space, gym_spaces.Discrete): return gymnasium_spaces.Discrete(n=space.n)
+        elif isinstance(space, gym_spaces.Tuple): return gymnasium_spaces.Tuple(tuple(self._convert_space(s) for s in space.spaces))
+        elif isinstance(space, gym_spaces.Dict): return gymnasium_spaces.Dict({key: self._convert_space(s) for key, s in space.spaces.items()})
+        else: return space # Pass through if unknown
+
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs); return obs, {}
+
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        terminated = done; truncated = info.get('TimeLimit.truncated', False)
+        return obs, reward, terminated, truncated, info
+
+
+class DiscreteActionWrapper(gymnasium.Wrapper):
+    """Ensures actions are int and rewards are scalar."""
+    def __init__(self, env):
+        super().__init__(env)
+        # Determine n_actions based on the original env's action space
+        original_action_space = env.action_space
+        if isinstance(original_action_space, (gym_spaces.Discrete, gymnasium_spaces.Discrete)):
+            n_actions = original_action_space.n
+        else:
+            # You might need a more robust way to determine n_actions
+            # if the original space isn't Discrete. For MultiGrid, 7 is common.
+            print("Warning: Original action space is not Discrete. Assuming 7 actions for DiscreteActionWrapper.")
+            n_actions = 7 # Default assumption for MultiGrid
+        self.action_space = gymnasium_spaces.Discrete(n_actions)
+
+    def step(self, action):
+        # Action should already be compatible if PPO uses the Discrete space
+        # Ensure it's an integer if coming from external source
+        try:
+            action_int = int(action)
+        except (ValueError, TypeError):
+            action_int = action # Pass through if already int or other type
+
+        # Call the wrapped env's step
+        obs, reward, terminated, truncated, info = self.env.step(action_int)
+
+        # Ensure reward is scalar (assuming multi-agent reward might be a list/array)
+        if isinstance(reward, (list, tuple, np.ndarray)) and len(reward) > 0:
+             scalar_reward = float(reward[0]) # Take the first agent's reward if vector
+        elif isinstance(reward, (int, float)):
+             scalar_reward = float(reward)
+        else:
+             print(f"Warning: Unexpected reward type in DiscreteActionWrapper: {type(reward)}, value: {reward}. Using 0.0.")
+             scalar_reward = 0.0
+
+        # Gymnasium step return order
+        return obs, scalar_reward, terminated, truncated, info
+
+class MultiAgentPPOController():
+    """Manages multiple PPO agents for a multi-agent environment."""
+    def __init__(self, config, env, device, training=True, with_expert=None, debug=False):
         self.config = config
-        self.debug = debug
+        self.env = env
         self.device = device
-        
-        # Inspect environment to understand structure
-        if hasattr(env, 'num_agents'):
-            self.n_agents = env.num_agents
-        elif hasattr(env, 'agents') and isinstance(env.agents, list):
-            self.n_agents = len(env.agents)
-        else:
-            print("Warning: Could not detect number of agents, defaulting to 3")
-            self.n_agents = 3
-        
-        print(f"Environment has {self.n_agents} agents")
-        
-        # Inspect action space
-        if hasattr(env, 'action_space'):
-            print(f"Environment action space: {env.action_space}")
-        
-        # Check if the environment has an Actions enum
-        if hasattr(env, 'Actions'):
-            print("Environment has Actions enum:")
-            for action in env.Actions:
-                print(f"  {action.value}: {action.name}")
-        
-        self.total_steps = 0
         self.training = training
-        
-        # Store metrics
-        self.metrics = {f"agent_{i}_reward": [] for i in range(self.n_agents)}
-        self.metrics["episodes"] = []
-        
-        # Set n_envs from config or default to 16
-        self.n_envs = getattr(config, 'n_envs', 16)  # Match config value
-        
-        # For decentralized training, we need one PPO agent per agent
-        self.ppo_agents = []
-        self.vec_envs = []
-        
-        # Decide on decentralized or centralized training
-        self.decentralized = getattr(config, 'decentralized_training', True)
-        print(f"Training mode: {'Decentralized' if self.decentralized else 'Coordinated'}")
-        
-        # Set up the model name
-        if not hasattr(config, 'model_name'):
-            config.model_name = f"{config.mode}_seed_{config.seed}_domain_{config.domain}_version_{config.version}"
-        
-        # Initialize wandb if not in debug mode
-        if not debug and training:
-            import wandb
-            self.wandb_run = wandb.init(
-                project=config.wandb_project,
-                config=vars(config),
-                name=config.model_name
-            )
-        else:
-            self.wandb_run = None
-        
-        # Create the environment and wrappers
-        for i in range(self.n_agents):
-            print(f"Creating PPO agent {i}")
-            
-            # Helper function to create environment
-            def make_env(env_id=None):
-                # Create a new environment instance
-                e = utils.make_env(config)
-                
-                # DEBUG: Print information about the environment
-                if hasattr(e, 'action_space'):
-                    print(f"Agent {i} - New env action space: {e.action_space}")
-                    
-                # Create a custom wrapper to handle the action/observation conversion
-                return MultiAgentToSingleAgentWrapper(e, agent_id=i)
-            
-            # Create a vectorized environment for this agent
-            from stable_baselines3.common.env_util import make_vec_env
-            vec_env = make_vec_env(
-                make_env,  # Use our environment factory
-                n_envs=self.n_envs,  # Use multiple environments for faster training
-                vec_env_cls=DummyVecEnv,  # Use DummyVecEnv for simplicity
-            )
-            self.vec_envs.append(vec_env)
-            
-            # Create PPO agent for this agent
-            from stable_baselines3 import PPO
-            ppo_agent = PPO(
-                "MultiInputPolicy",
-                vec_env,
-                verbose=self.config.verbose,
-                batch_size=self.config.batch_size,
-                n_steps=self.config.num_steps,
-                gamma=self.config.gamma,
-                learning_rate=self.config.learning_rate,
-                ent_coef=self.config.entropy_coef,
-                clip_range=self.config.clip_param,
-                n_epochs=self.config.ppo_epochs,
-                vf_coef=self.config.value_loss_coef,
-                max_grad_norm=self.config.max_grad_norm,
-                gae_lambda=self.config.gae_lambda,
-                device=self.device,
-                # Additional parameters for better exploration
-                target_kl=self.config.target_kl,  # Target KL divergence to prevent too large policy updates
-                normalize_advantage=True  # Normalize advantages for more stable training
-            )
-            self.ppo_agents.append(ppo_agent)
-        
-        # For backward compatibility
-        self.agents = self.ppo_agents
+        self.debug = debug
+        self.n_agents = env.n_agents
+        self.default_model_path = os.path.join('models', config.experiment_name, config.model_name)
+        print(f"Initializing MultiAgentPPOController ({self.n_agents} agents).")
 
-    def get_agent_obs(self, state, agent_id):
-        """Extract observation for a specific agent"""
-        # Check if state is already a dict (suitable for a single agent)
-        if isinstance(state, dict):
-            return state
+        # --- Initialize Environment ---
+        # Wrap the environment to make it compatible with gymnasium
+        wrapped_env = DiscreteActionWrapper(GymToGymnasiumAdapter(self.env))
         
-        # Handle tuple/list observations from multi-agent env
-        if isinstance(state, (tuple, list)) and len(state) > agent_id:
-            agent_state = state[agent_id]
+        # Debug info
+        print(f"Environment observation space: {wrapped_env.observation_space}")
+        print(f"Environment action space: {wrapped_env.action_space}")
         
-            # Convert to dict format if needed
-            if not isinstance(agent_state, dict):
-                return {
-                    'image': agent_state,
-                    'direction': np.array(0)
-                }
-            return agent_state
+        # --- Initialize PPO Agents ---
+        self.agents = []
+        for i in range(self.n_agents):
+            try:
+                print(f"Creating PPO agent {i} with MultiInputPolicy")
+                agent = PPO(
+                    policy="MultiInputPolicy",
+                    env=wrapped_env,  # All agents share the same environment
+                    verbose=0,
+                    device=self.device,
+                    gamma=config.get('gamma', 0.99),
+                    n_steps=config.get('n_steps', 2048),
+                    ent_coef=config.get('ent_coef', 0.01),
+                    learning_rate=float(config.get('learning_rate', 3e-4)),
+                    vf_coef=config.get('vf_coef', 0.5),
+                    max_grad_norm=config.get('max_grad_norm', 0.5),
+                    gae_lambda=config.get('gae_lambda', 0.95),
+                    n_epochs=config.get('n_epochs', 10),
+                    clip_range=config.get('clip_range', 0.2),
+                    batch_size=config.get('batch_size', 64)
+                )
+                self.agents.append(agent)
+                print(f"Successfully created PPO agent {i}")
+            except Exception as e:
+                print(f"Error creating PPO agent {i}: {e}")
+                raise
+
+        # --- Initialize tracking variables ---
+        self.total_steps = 0
         
-        # If state is a numpy array, assume it's an image
-        if isinstance(state, np.ndarray):
-            return {
-                'image': state,
-                'direction': np.array(0)
-            }
-        
-        # Fallback for unexpected formats
-        print(f"Warning: Unexpected state format in get_agent_obs: {type(state)}")
-        # Return empty observation as a last resort
-        return {
-            'image': np.zeros((5, 5, 3), dtype=np.uint8),
-            'direction': np.array(0)
-        }
+        # --- Initialize buffers for training ---
+        if self.training:
+            try:
+                self.buffers = [agent.rollout_buffer for agent in self.agents]
+            except AttributeError:
+                raise AttributeError("PPO agents lack 'rollout_buffer'.")
+
+        # Add in __init__:
+        self.device = device  # Store the device
+
+    # ==========================================================================
+    # Core RL Loop
+    # ==========================================================================
 
     def run_one_episode(self, env, episode, log=True, train=True, save_model=True, visualize=False):
-        """Run one episode"""
-        viz_data = None
-        if visualize:
-            viz_data = self._init_visualization_data(env)
-            print(f"[MetaController] Visualization enabled for episode {episode}")
-            print(f"[MetaController] Visualization will use deterministic={visualize}")
-            
-        # Add debug prints for model loading status
-        print(f"[MetaController] Agent models loaded status:")
-        for i, agent in enumerate(self.agents):
-            print(f"  Agent {i} loaded: {hasattr(agent, 'policy') and agent.policy is not None}")
-        
-        # Reset environment
-        state = env.reset()
-        
-        # Print initial observation format
-        print(f"[MetaController] Initial state type: {type(state)}")
-        if isinstance(state, dict):
-            print(f"  State keys: {state.keys()}")
-        elif isinstance(state, (list, tuple)):
-            print(f"  State is a list/tuple with {len(state)} elements")
-            if len(state) > 0:
-                print(f"  First element type: {type(state[0])}")
-        
-        # Initialize episode data
+        # Initialize episode
+        state, _ = env.reset()
+        viz_data = self.init_visualization_data(env, state) if visualize else None
+        rewards = []
         done = False
-        episode_states = []
-        episode_actions = []
-        episode_rewards = []
-        rewards = []  # For tracking reward over time
-        steps = 0
-        total_episode_reward = 0
-        episode_start_time = time.time()
-        
-        # Use save_interval from ppo.yaml if available, or fall back to a default
-        save_interval = getattr(self.config, 'save_interval', 10000)
-        
-        # For debugging: force non-deterministic during visualization
-        force_explore = getattr(self.config, 'force_explore', False)
-        if force_explore:
-            print("[MetaController] FORCING EXPLORATION MODE (non-deterministic actions)")
+        t = 0
+
+        while not done:
+            self.total_steps += 1
+            t += 1
             
-        # Anti-stuck mechanism
-        MAX_STUCK_STEPS = 5
-        stuck_counter = 0
-        last_actions = None
-        
-        # Increase episode length for both training and visualization
-        MAX_STEPS = 500 if visualize else 1000  # Longer for training, bit shorter for visualization
-        
-        # Track repetitive actions for penalty
-        action_history = [[] for _ in range(self.n_agents)]
-        
-        while not done and steps < MAX_STEPS:
-            # Collect all agent actions
+            # Get actions from all agents
             actions = []
+            log_probs = []
+            values = []
+
             for i in range(self.n_agents):
-                agent = self.agents[i]
-                agent_obs = self.get_agent_obs(state, i)
-                
-                # Debug print for observation format
-                if steps == 0:
-                    print(f"[DEBUG] Agent {i} observation shape/format:")
-                    if isinstance(agent_obs, dict):
-                        for k, v in agent_obs.items():
-                            if isinstance(v, np.ndarray):
-                                print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
-                            elif isinstance(v, torch.Tensor):
-                                print(f"  {k}: shape={v.shape}, dtype={v.dtype}")
-                            else:
-                                print(f"  {k}: {type(v)}")
-                
-                # For both visualization and training, we'll use the predict method
-                # deterministic=False for training to include exploration
-                
-                # Anti-stuck mechanism: if repeating the same actions for too long, force exploration
-                if stuck_counter >= MAX_STUCK_STEPS:
-                    deterministic = False
-                    if stuck_counter == MAX_STUCK_STEPS:
-                        print(f"[DEBUG] Detected stuck pattern at step {steps}. Forcing exploration!")
-                else:
-                    # Use deterministic for visualization, non-deterministic for training
-                    deterministic = visualize 
-                
-                with torch.no_grad():
-                    action, _ = agent.predict(agent_obs, deterministic=deterministic)
-                
-                actions.append(action)
-                
-                # Store action in history for this agent (for repetitive action penalty)
-                if train:
-                    action_val = action.item() if hasattr(action, 'item') else int(action)
-                    action_history[i].append(action_val)
-                    # Keep only last 10 actions
-                    if len(action_history[i]) > 10:
-                        action_history[i].pop(0)
-            
-            # Check if actions are the same as last step (for stuck detection)
-            current_actions_list = [a.item() if hasattr(a, 'item') else int(a) for a in actions]
-            if last_actions == current_actions_list:
-                stuck_counter += 1
-            else:
-                stuck_counter = 0
-            last_actions = current_actions_list
-            
-            # Debug print for actions
-            if steps % 10 == 0 or steps < 5 or stuck_counter > 0:
-                print(f"[DEBUG] Step {steps} actions: {current_actions_list} {'(Stuck!)' if stuck_counter > 0 else ''}")
-            
-            # Take a step in the environment
-            next_state, reward, done, info = env.step(actions)
-            
-            # Apply repetitive action penalty during training to encourage exploration
-            if train:
-                modified_reward = []
-                for i, r in enumerate(reward if isinstance(reward, (list, tuple)) else [reward] * self.n_agents):
-                    # Check for repetitive actions
-                    if len(action_history[i]) >= 5:
-                        last_5_actions = action_history[i][-5:]
-                        # Count number of movement actions (0=left, 1=right, 2=forward)
-                        movement_count = sum(1 for a in last_5_actions if a in [0, 1, 2])
-                        
-                        # If too few movement actions, apply penalty
-                        if movement_count < 2:  # Less than 2 movement actions in last 5
-                            r -= 0.01  # Small penalty for not moving
-                            
-                        # Check for same action repeated
-                        if len(set(last_5_actions)) == 1:  # Same action repeated 5 times
-                            r -= 0.02  # Larger penalty for repeating exact same action
+                try:
+                    # Get action from policy
+                    action, _ = self.agents[i].predict(state, deterministic=False)
+                    actions.append(action.item() if isinstance(action, np.ndarray) else action)
                     
-                    modified_reward.append(r)
-                
-                # Replace reward with modified version for training
-                reward = modified_reward if len(modified_reward) > 1 else modified_reward[0]
+                    # Get value and log_prob for training
+                    state_tensor = {k: torch.as_tensor(v, device=self.device).unsqueeze(0) 
+                                  for k, v in state.items() 
+                                  if k in self.agents[i].observation_space.spaces}
+                    action_tensor = torch.as_tensor([action], device=self.device)
+                    value, log_prob, _ = self.agents[i].policy.evaluate_actions(state_tensor, action_tensor)
+                    values.append(value.detach().cpu().item())
+                    log_probs.append(log_prob.detach().cpu().item())
+                except Exception as e:
+                    # Fallback to random action if prediction fails
+                    actions.append(self.agents[i].action_space.sample())
+                    values.append(0.0)
+                    log_probs.append(0.0)
             
-            # Calculate total reward for this step
-            step_reward = sum(reward) if isinstance(reward, (list, tuple)) else reward
-            total_episode_reward += step_reward
+            # Step environment
+            try:
+                next_state, step_rewards, terminated, truncated, info = env.step(actions)
+                done = terminated or truncated
+            except Exception as e:
+                print(f"Error in env.step: {e}")
+                next_state, step_rewards = state, [0.0] * self.n_agents
+                done = True
             
-            # For visualization purposes
-            if visualize:
-                if steps % 10 == 0:  # More frequent logs for debugging
-                    print(f"[MetaController] Visualization step {steps}: Actions={current_actions_list}, Reward={step_reward:.2f}")
-                viz_data = self._add_visualization_data(viz_data, env, state, actions, next_state)
-                rewards.append(reward)
+            # Record rewards
+            rewards.append(step_rewards)
             
-            # Store episode data
-            episode_states.append(state)
-            episode_actions.append(actions)
-            episode_rewards.append(reward)
+            # Add experience to buffers if training
+            if self.training:
+                for i in range(self.n_agents):
+                    try:
+                        agent_reward = step_rewards[i] if isinstance(step_rewards, (list, tuple, np.ndarray)) else step_rewards
+                        self.buffers[i].add(state, actions[i], agent_reward, done, values[i], log_probs[i])
+                    except Exception as e:
+                        pass  # Silent fail to avoid disrupting episode
+            
+            # Add visualization data if requested
+            if visualize and viz_data:
+                viz_data = self.add_visualization_data(viz_data, env, state, actions, next_state)
             
             # Update state
             state = next_state
-            steps += 1
-            self.total_steps += 1
             
-            # Maybe update policy, save model, etc.
-            if train and (done or self.total_steps % self.config.num_steps == 0):
-                self._update_models()
-            
-            # Use save_interval instead of save_model_every
-            if save_model and self.total_steps % save_interval == 0:
-                print(f"[MetaController] Saving models at step {self.total_steps}")
-                self._save_models(episode)
-            
-            if done:
-                episode_duration = time.time() - episode_start_time
-                print(f"[MetaController] Episode {episode} completed - {steps} steps, reward: {total_episode_reward:.2f}")
-                # Print final actions summary
-                print(f"[DEBUG] Final episode actions distribution:")
-                action_counts = {}
-                for step_actions in episode_actions:
-                    for i, a in enumerate(step_actions):
-                        a_val = a.item() if hasattr(a, 'item') else int(a)
-                        key = f"agent_{i}_action_{a_val}"
-                        action_counts[key] = action_counts.get(key, 0) + 1
-                for k, v in action_counts.items():
-                    print(f"  {k}: {v} times ({v/steps*100:.1f}%)")
-                
-                if log:
-                    self._log_episode(episode, steps, episode_rewards)
-                break
+            # Update models if training
+            if self.training:
+                self.update_models(state, done)
         
-        if visualize:
+        # End of episode processing
+        total_reward = np.sum(rewards)
+        if log and not self.debug:
+            self.log_one_episode(episode, t, rewards)
+        
+        self.print_terminal_output(episode, total_reward)
+        
+        if save_model:
+            self.save_model_checkpoints(episode)
+        
+        if visualize and viz_data:
             viz_data['rewards'] = np.array(rewards)
             return viz_data
+        
+        return None
 
-    def _update_models(self):
-        """Update all agent models - optimized for speed"""
-        if self.total_steps >= self.config.initial_memory:
-            if self.total_steps % self.config.update_every == 0:
-                for agent_id, agent in enumerate(self.agents):
-                    # Pass a larger num_timesteps value for faster learning
-                    agent.learn(total_timesteps=self.config.num_steps * 2)
-                if self.total_steps % 5000 == 0:  # Less frequent logging
-                    print(f"[MetaController] Updated agent models at step {self.total_steps}")
-
-    def _log_episode(self, episode, steps, rewards):
-        """Log episode metrics to wandb"""
-        rewards = np.array(rewards)
-        total_reward = np.sum(rewards)
-        wandb.log({
-            "episode/x_axis": episode,
-            "episode/reward": total_reward,
-            "episode/length": steps,
-        })
-
-    def _save_models(self, episode):
-        """Save model checkpoints"""
-        save_model_episode = getattr(self.config, 'save_model_episode', 10000)
-        if episode % save_model_episode == 0:
-            print(f"[MetaController] Saving model checkpoints at episode {episode}")
-            for i, agent in enumerate(self.agents):
-                save_path = f"models/agent_{i}_episode_{episode}"
-                agent.save(save_path)
-            print(f"[MetaController] Checkpoint saving complete")
-
-    def load_models(self, model_path=None):
-        """Load saved models"""
-        if not model_path:
-            return
-        print(f"[MetaController] Loading models from {model_path}")
-        for i, agent in enumerate(self.agents):
-            path = f"{model_path}_agent_{i}" if model_path else f"models/agent_{i}"
-            try:
-                agent.load(path)
-                print(f"[MetaController] Loaded agent {i} from {path}")
-            except Exception as e:
-                print(f"[MetaController] Error loading agent {i}: {e}")
+    def update_models(self, last_obs, done):
+        if not self.training or self.total_steps <= self.config.get('initial_memory', 0): return
+        buffer0 = self.buffers[0]
+        is_buffer_ready = (hasattr(buffer0, 'pos') and hasattr(buffer0, 'buffer_size') and buffer0.pos == buffer0.buffer_size)
+        if is_buffer_ready:
+            for i in range(self.n_agents):
+                try:
+                    last_obs_tensor = {k: torch.as_tensor(v, device=self.device).unsqueeze(0) for k, v in last_obs.items() if k in self.agents[i].observation_space.spaces}
+                    with torch.no_grad(): last_value = self.agents[i].policy.predict_values(last_obs_tensor).cpu().numpy()
+                    self.buffers[i].compute_returns_and_advantage(last_values=last_value, dones=np.array([done]))
+                    self.agents[i].train()
+                except Exception as e: print(f"ERROR update agent {i}: {e}")
 
     def train(self, env):
-        """Train all agents in a truly multi-agent fashion"""
-        # Get n_episodes from config - prioritize the one from YAML
-        if hasattr(self.config, 'n_episodes'):
-            n_episodes = self.config.n_episodes
-            print(f"[MetaController] Using n_episodes={n_episodes} from config")
-        else:
-            n_episodes = 1000  # Default fallback
-            print(f"[MetaController] Warning: n_episodes not found in config, using default: {n_episodes}")
-            
-        print(f"\n[MetaController] Starting multi-agent training for {n_episodes} episodes")
-        print(f"[MetaController] Config: batch_size={self.config.batch_size}, lr={self.config.learning_rate}, n_envs={self.n_envs}")
-        print(f"[MetaController] Models will save every {getattr(self.config, 'save_model_episode', 10000)} episodes and every {getattr(self.config, 'save_interval', 10000)} steps")
-        
-        # Set up progress bar for episodes
-        try:
-            from tqdm import tqdm
-            progress_bar = tqdm(total=n_episodes, desc="Training Progress", unit="episode")
-        except ImportError:
-            print("[MetaController] tqdm not installed. Install with 'pip install tqdm' for progress bar.")
-            progress_bar = None
-            
-        # Create directories if they don't exist
-        os.makedirs("models", exist_ok=True)
-        os.makedirs("plots", exist_ok=True)
-        
-        # Initialize metrics tracking
-        self.metrics = {
-            "episodes": [],
-            "collective_return": [],
-        }
-        
-        for i in range(self.n_agents):
-            self.metrics[f"agent_{i}_reward"] = []
-        
-        # Create learning curve figure
-        self._init_learning_curves()
-        
-        # Set up the environment
-        start_time = time.time()
-        episode_reward = np.zeros(self.n_agents)
-        episode_rewards_history = []
-        episode_lengths = []
-        
-        try:
-            # Main training loop - truly multi-agent
-            for episode in range(1, n_episodes + 1):
-                # Reset environment
-                state = env.reset()
-                episode_reward = np.zeros(self.n_agents)
-                episode_step = 0
-                done = False
-                episode_start_time = time.time()
-                
-                # Initialize tracking for action repetition
-                last_actions = [0] * self.n_agents
-                
-                # Run one episode
-                while not done and episode_step < 500:  # Cap at 500 steps
-                    # Get all agents' actions
-                    actions = []
-                    for i in range(self.n_agents):
-                        # Get observation for this agent
-                        agent_obs = self.get_agent_obs(state, i)
-                        
-                        # Get action from this agent's policy
-                        action, _ = self.ppo_agents[i].predict(agent_obs, deterministic=False)
-                        
-                        # Ensure action is valid
-                        if isinstance(action, np.ndarray):
-                            action = action.item()
-                        action = int(action) % 7
-                        
-                        actions.append(action)
-                    
-                    # Step environment with all actions together
-                    next_state, rewards, done, info = env.step(actions)
-                    
-                    # Apply reward shaping to encourage movement and exploration
-                    shaped_rewards = []
-                    for i, r in enumerate(rewards if isinstance(rewards, (list, tuple)) else [rewards] * self.n_agents):
-                        # Original reward
-                        shaped_r = r
-                        
-                        # Bonus for movement actions
-                        if actions[i] in [0, 1, 2]:  # left, right, forward
-                            shaped_r += 0.01  # Small bonus for movement
-                            
-                        # Penalty for typical "stuck" actions
-                        if actions[i] in [3, 4, 5]:  # pickup, drop, toggle
-                            # Count how many times these actions have been taken
-                            if episode_step > 0 and i < len(last_actions) and last_actions[i] == actions[i]:
-                                shaped_r -= 0.005  # Small penalty for repeating non-movement actions
-                                
-                        shaped_rewards.append(shaped_r)
-                    
-                    # Store last actions for comparison in next step
-                    last_actions = actions.copy()
-                    
-                    # Update episode rewards with shaped rewards
-                    episode_reward += np.array(shaped_rewards) if len(shaped_rewards) > 1 else np.array([shaped_rewards[0]] * self.n_agents)
-                    
-                    # Update state
-                    state = next_state
-                    episode_step += 1
-                    
-                    # Every 100 steps, update the learning curves
-                    if episode_step % 100 == 0:
-                        self._update_learning_curves()
-                
-                # Update progress bar
-                if progress_bar is not None:
-                    progress_bar.update(1)
-                    progress_bar.set_postfix({"Total Reward": f"{np.sum(episode_reward):.2f}"})
-                
-                # Log episode results
-                episode_rewards_history.append(episode_reward)
-                episode_lengths.append(episode_step)
-                episode_duration = time.time() - episode_start_time
-                
-                # Update metrics
-                self.metrics["episodes"].append(episode)
-                self.metrics["collective_return"].append(np.sum(episode_reward))
-                for i in range(self.n_agents):
-                    self.metrics[f"agent_{i}_reward"].append(episode_reward[i])
-                
-                # Log episode summary for key milestones
-                if episode % max(1, min(100, n_episodes // 10)) == 0:
-                    elapsed_time = time.time() - start_time
-                    hours, remainder = divmod(elapsed_time, 3600)
-                    minutes, seconds = divmod(remainder, 60)
-                    print(f"[MetaController] Episode {episode}/{n_episodes} - Duration: {episode_duration:.2f}s, Steps: {episode_step}, Total reward: {np.sum(episode_reward):.2f}")
-                    print(f"[MetaController] Total training time so far: {int(hours)}h {int(minutes)}m {int(seconds)}s")
-                
-                # Log to wandb every 10 episodes
-                if episode % 10 == 0 and wandb.run is not None:
-                    log_dict = {
-                        "episode": episode,
-                        "mean_length": np.mean(episode_lengths[-100:]),
-                        "collective_return": np.sum(episode_reward),
-                        "progress": episode / n_episodes,
-                    }
-                    
-                    for i in range(self.n_agents):
-                        log_dict[f"agent_{i}/reward"] = episode_reward[i]
-                        log_dict[f"agent_{i}/mean_reward"] = np.mean([r[i] for r in episode_rewards_history[-100:]])
-                    
-                    wandb.log(log_dict)
-                
-                # Update learning curves and print progress every 100 episodes
-                if episode % 100 == 0:
-                    self._update_learning_curves()
-                    mean_100ep_reward = [np.mean([r[i] for r in episode_rewards_history[-100:]]) for i in range(self.n_agents)]
-                    elapsed_time = time.time() - start_time
-                    hours, remainder = divmod(elapsed_time, 3600)
-                    minutes, seconds = divmod(remainder, 60)
-                    
-                    print(f"[MetaController] Stats after {episode} episodes: "
-                          f"Mean 100ep rewards: {[f'{r:.2f}' for r in mean_100ep_reward]}, "
-                          f"Collective: {np.sum(mean_100ep_reward):.2f}")
-                    print(f"[MetaController] Training time: {int(hours)}h {int(minutes)}m {int(seconds)}s ({elapsed_time:.2f}s total)")
-                
-                # Train all agents using their collected experiences
-                if episode % 10 == 0:  # Train every 10 episodes
-                    for i in range(self.n_agents):
-                        # Create mini-batch of experiences for this agent
-                        self.ppo_agents[i].learn(
-                            total_timesteps=1000,  # Small number of steps 
-                            reset_num_timesteps=False,  # Don't reset timestep counter
-                            progress_bar=False
-                        )
-                
-                # Save models periodically
-                save_model_episode = getattr(self.config, 'save_model_episode', 10000)
-                if episode % save_model_episode == 0:
-                    print(f"[MetaController] Saving model checkpoint at episode {episode}...")
-                    for i in range(self.n_agents):
-                        save_path = f"models/agent_{i}_episode_{episode}"
-                        self.ppo_agents[i].save(save_path)
-                
-                # Save final models
-                if episode % 1000 == 0:
-                    print(f"[MetaController] Saving regular checkpoint at episode {episode}")
-                    for i in range(self.n_agents):
-                        save_path = f"models/agent_{i}_ppo"
-                        self.ppo_agents[i].save(save_path)
-                        
-                # Check if we've reached the target number of episodes
-                if episode >= n_episodes:
-                    print(f"[MetaController] Reached target of {n_episodes} episodes. Training complete.")
-                    break
-            
-            # Final save when training completes
-            print(f"[MetaController] Saving final models after {n_episodes} episodes")
-            for i in range(self.n_agents):
-                save_path = f"models/agent_{i}_final"
-                self.ppo_agents[i].save(save_path)
-                
-        except KeyboardInterrupt:
-            print(f"[MetaController] Training interrupted at episode {episode}. Saving current models...")
-            for i in range(self.n_agents):
-                self.ppo_agents[i].save(f"models/agent_{i}_interrupted")
-        finally:
-            # Close progress bar
-            if progress_bar is not None:
-                progress_bar.close()
-                
-            # Training complete, generate final learning curves
-            self._create_learning_curves(final=True)
-            training_time = time.time() - start_time
-            hours, remainder = divmod(training_time, 3600)
-            minutes, seconds = divmod(remainder, 60)
-            print(f"[MetaController] Training completed in {int(hours)}h {int(minutes)}m {int(seconds)}s")
-            
-            # Close environments to release resources
-            for vec_env in self.vec_envs:
-                vec_env.close()
-            
-            # Return final models to signal completion
-            return self.ppo_agents
-
-    def _init_learning_curves(self):
-        """Initialize learning curves"""
-        try:
-            import matplotlib.pyplot as plt
-            
-            self.fig, self.ax = plt.figure(figsize=(10, 6)), plt.gca()
-            self.ax.set_xlabel("Training Steps")
-            self.ax.set_ylabel("Average Reward")
-            self.ax.set_title("Agent Learning Curves")
-            
-            # Initialize empty lines
-            self.plot_lines = {}
-            for i in range(self.n_agents):
-                line, = self.ax.plot([], [], label=f"Agent {i}")
-                self.plot_lines[f"agent_{i}"] = line
-            
-            self.ax.legend()
-            plt.savefig("plots/learning_curves_initial.png")
-            
-            if wandb.run is not None:
-                wandb.log({"learning_curves": wandb.Image("plots/learning_curves_initial.png")})
-            
-        except Exception as e:
-            print(f"Error setting up learning curves: {e}")
-
-    def _update_learning_curves(self):
-        """Update learning curves during training"""
-        try:
-            import matplotlib.pyplot as plt
-            
-            # Update each line
-            for i in range(self.n_agents):
-                key = f"agent_{i}_reward"
-                if key in self.metrics and len(self.metrics[key]) > 0:
-                    x_data = self.metrics["episodes"]
-                    y_data = self.metrics[key]
-                    
-                    if len(x_data) != len(y_data):
-                        # Ensure equal lengths
-                        min_len = min(len(x_data), len(y_data))
-                        x_data = x_data[:min_len]
-                        y_data = y_data[:min_len]
-                    
-                    self.plot_lines[f"agent_{i}"].set_data(x_data, y_data)
-            
-            # Update plot limits
-            if len(self.metrics["episodes"]) > 0:
-                self.ax.set_xlim(0, max(self.metrics["episodes"]) * 1.1)
-                
-                # Find reasonable y limits
-                all_rewards = []
-                for i in range(self.n_agents):
-                    key = f"agent_{i}_reward"
-                    if key in self.metrics:
-                        all_rewards.extend(self.metrics[key])
-                
-                if all_rewards:
-                    self.ax.set_ylim(min(all_rewards) * 1.1, max(all_rewards) * 1.1)
-            
-            # Save updated plot
-            self.fig.canvas.draw()
-            plt.savefig("plots/learning_curves_current.png")
-            
-            # Log to wandb
-            if wandb.run is not None:
-                wandb.log({"learning_curves": wandb.Image("plots/learning_curves_current.png")})
-            
-        except Exception as e:
-            print(f"Error updating learning curves: {e}")
-
-    def _create_learning_curves(self, final=False):
-        """Generate final learning curves"""
-        try:
-            import matplotlib.pyplot as plt
-            
-            # Create new figure for final plot
-            plt.figure(figsize=(12, 8))
-            
-            # Plot each agent's learning curve
-            for i in range(self.n_agents):
-                key = f"agent_{i}_reward"
-                if key in self.metrics and len(self.metrics[key]) > 0:
-                    x_data = self.metrics["episodes"]
-                    y_data = self.metrics[key]
-                    
-                    if len(x_data) != len(y_data):
-                        # Ensure equal lengths
-                        min_len = min(len(x_data), len(y_data))
-                        x_data = x_data[:min_len]
-                        y_data = y_data[:min_len]
-                    
-                    plt.plot(x_data, y_data, marker='.', linestyle='-', label=f"Agent {i}")
-            
-            plt.xlabel("Training Steps")
-            plt.ylabel("Average Reward")
-            plt.title("MultiGrid Agent Learning Curves")
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-            
-            # Save final high-quality plot
-            filename = "plots/learning_curves_final.png" if final else "plots/learning_curves.png"
-            plt.savefig(filename, dpi=300)
-            plt.close()
-            
-            # Log to wandb
-            if wandb.run is not None:
-                wandb.log({
-                    "final_learning_curves" if final else "learning_curves": 
-                    wandb.Image(filename)
-                })
-            
-        except Exception as e:
-            print(f"Error creating learning curves: {e}")
-
-    def visualize(self, env, mode, video_dir='videos', viz_data=None):
-        """Create visualization video"""
-        print(f"[MetaController] Starting visualization in {video_dir}")
-        print(f"[MetaController] Model info before visualization:")
-        for i, agent in enumerate(self.agents):
-            print(f"  Agent {i} model type: {type(agent)}")
-            if hasattr(agent, 'policy'):
-                print(f"  Agent {i} policy type: {type(agent.policy)}")
-            
-        if not viz_data:
-            print("[MetaController] Running episode for visualization with deterministic=True")
-            viz_data = self.run_one_episode(env, episode=0, log=False, train=False, 
-                                          save_model=False, visualize=True)
-        
-        # Set up video directory
-        video_path = os.path.join(video_dir, self.config.domain)
-        if not os.path.exists(video_path):
-            os.makedirs(video_path)
-        print(f"[MetaController] Video will be saved to {video_path}")
-        
-        # Get action names
-        action_dict = {}
-        for act in env.Actions:
-            action_dict[act.value] = act.name
-        print(f"[MetaController] Action mapping: {action_dict}")
-        
-        # Create frames
-        traj_len = len(viz_data['rewards'])
-        print(f"[MetaController] Creating {traj_len} visualization frames")
-        # Print some statistics about actions
-        if 'actions' in viz_data and len(viz_data['actions']) > 0:
-            all_actions = []
-            # Convert numpy arrays to integers before adding to list
-            for step_actions in viz_data['actions']:
-                step_actions_int = []
-                for a in step_actions:
-                    # Convert numpy array to integer if needed
-                    if hasattr(a, 'item'):
-                        step_actions_int.append(a.item())
-                    else:
-                        step_actions_int.append(int(a))
-                all_actions.extend(step_actions_int)
-            
-            action_freq = {}
-            for a in all_actions:
-                action_freq[a] = action_freq.get(a, 0) + 1
-            print(f"[MetaController] Action frequency in trajectory: {action_freq}")
-        
-        for t in range(traj_len):
-            self._visualize_frame(t, viz_data, action_dict, video_path)
-            if t % 25 == 0:
-                print(f"[MetaController] Creating frame {t}/{traj_len}")
-                if t > 0:
-                    # Convert numpy arrays to integers for printing
-                    actions_to_print = []
-                    for a in viz_data['actions'][t-1]:
-                        if hasattr(a, 'item'):
-                            actions_to_print.append(a.item())
-                        else:
-                            actions_to_print.append(int(a))
-                    print(f"  Actions at this step: {actions_to_print}")
-                    print(f"  Rewards at this step: {viz_data['rewards'][t-1]}")
-        
-        # Create video
-        video_name = f'{mode}_trajectory_video'
-        print(f"[MetaController] Creating final video: {video_name}")
-        make_video(video_path, video_name)
-        print(f"[MetaController] Visualization complete: {os.path.join(video_path, video_name)}.mp4")
-
-    def _init_visualization_data(self, env):
-        """Initialize data structure for visualization"""
-        return {
-            'agents_partial_images': [],
-            'actions': [],
-            'full_images': [env.render('rgb_array')],
-        }
-
-    def _add_visualization_data(self, viz_data, env, state, actions, next_state):
-        """Add frame data to visualization"""
-        # Convert numpy arrays to integers before storing
-        actions_int = []
-        for a in actions:
-            if hasattr(a, 'item'):
-                actions_int.append(a.item())
+        print(f"Starting training: {self.config.n_episodes} episodes...")
+        for episode in range(self.config.n_episodes):
+            viz_interval = self.config.get('visualize_every', 0)
+            viz_ep = (viz_interval > 0 and (episode + 1) % viz_interval == 0 and not self.debug)
+            if viz_ep:
+                print(f"-- Vis Ep {episode+1} --")
+                viz_data = self.run_one_episode(env, episode, log=False, train=False, save_model=False, visualize=True)
+                if viz_data: self.visualize(env, f"{self.config.mode}_ep{episode+1}", viz_data=viz_data)
+                # Optional: also train on viz episode? self.run_one_episode(env, episode, ... train=True ...)
             else:
-                actions_int.append(int(a))
-        viz_data['actions'].append(actions_int)
-        
-        # Process agent observations for visualization
-        agent_images = []
+                self.run_one_episode(env, episode, log=True, train=True, save_model=True, visualize=False)
+        self.close_envs()
+        print("Training complete.")
+
+    # ==========================================================================
+    # Helper Methods
+    # ==========================================================================
+
+    def save_model_checkpoints(self, episode):
+        save_interval = self.config.get('save_model_episode', 0)
+        if save_interval > 0 and episode > 0 and episode % save_interval == 0:
+            path = self.default_model_path
+            os.makedirs(path, exist_ok=True)
+            # print(f"Saving models ep {episode} to {path}") # Less verbose
+            for i in range(self.n_agents):
+                try: self.agents[i].save(os.path.join(path, f'agent_{i}_ep{episode}'))
+                except Exception as e: print(f"ERROR saving agent {i}: {e}")
+
+    def load_models(self, model_path=None):
+        load_path_base = model_path if model_path is not None else self.default_model_path
+        print(f"Loading models from: {load_path_base}")
+        loaded_count = 0
         for i in range(self.n_agents):
-            agent_obs = self.get_agent_obs(state, i)
-            agent_image = agent_obs['image']
-            
-            # Convert list to numpy array if needed
-            if isinstance(agent_image, list):
-                agent_image = np.array(agent_image)
-                
-            # Ensure agent_image is a numpy array, not a tensor
-            if isinstance(agent_image, torch.Tensor):
-                agent_image = agent_image.cpu().numpy()
-            
-            # IMPORTANT: Extract this agent's observation if observations are stacked for all agents
-            if len(agent_image.shape) == 4 and agent_image.shape[0] == self.n_agents:  
-                # If first dimension matches number of agents, extract this agent's observation
-                agent_image = agent_image[i]  # Select the observation for this agent
-                print(f"Using agent {i}'s observation from stacked array: shape={agent_image.shape}")
-            
-            # Only attempt rendering if we have a valid numpy array
-            try:
-                rendered_image = env.get_obs_render(agent_image)
-                agent_images.append(rendered_image)
-            except Exception as e:
-                print(f"ERROR: Could not render agent {i} observation: {e}")
-                print(f"Agent {i} observation shape after processing: {agent_image.shape}")
-                # Use a blank image as fallback
-                agent_images.append(np.zeros((84, 84, 3), dtype=np.uint8))
-        
-        viz_data['agents_partial_images'].append(agent_images)
-        
-        # Capture full environment image
+             agent_zip = os.path.join(load_path_base, f'agent_{i}') + ".zip" # Simplistic path
+             # Add logic here to find latest checkpoint if needed
+             if os.path.exists(agent_zip):
+                  try:
+                      env_ref = self.agents[i].get_env()
+                      self.agents[i] = PPO.load(agent_zip, env=env_ref, device=self.device)
+                      if self.training: self.buffers[i] = self.agents[i].rollout_buffer # Relink buffer
+                      loaded_count += 1
+                  except Exception as e: print(f"Warn load agent {i}: {e}")
+             # else: print(f"Warn: Model not found for agent {i} at {agent_zip}") # Less verbose
+        print(f"Loaded {loaded_count}/{self.n_agents} models.")
+
+    def print_terminal_output(self, episode, total_reward):
+        print_interval = self.config.get('print_every', 10)
+        if print_interval > 0 and (episode == 0 or (episode + 1) % print_interval == 0):
+            print(f'Steps: {self.total_steps:<8} | Ep: {episode:<5} | Rew: {total_reward:<8.2f}')
+
+    def log_one_episode(self, episode, t, rewards):
+        """Log episode metrics to wandb"""
+        try:
+            total_reward = np.sum(rewards)
+            wandb.log({
+                'Episode': episode, 
+                'Episode Length': t, 
+                'Total Reward': total_reward,
+                'Steps': self.total_steps
+            })
+        except Exception as e:
+            # Silent fail to avoid disrupting training
+            pass
+
+    def init_visualization_data(self, env, state):
+        viz_data = {'agents_partial_images': [], 'actions': [], 'full_images': [], 'rewards': []}
         try:
             viz_data['full_images'].append(env.render('rgb_array'))
-        except Exception as e:
-            print(f"Warning: Could not render full environment: {e}")
-            # Use last image or create blank image as fallback
-            if len(viz_data['full_images']) > 0:
-                viz_data['full_images'].append(viz_data['full_images'][-1])
-            else:
-                viz_data['full_images'].append(np.zeros((500, 500, 3), dtype=np.uint8))
-        
+            partial_views = [env.get_obs_render(self.get_agent_state(state, i).get('image'))
+                             if hasattr(env, 'get_obs_render') and self.get_agent_state(state, i)
+                             else np.zeros((64,64,3), dtype=np.uint8)
+                             for i in range(self.n_agents)]
+            viz_data['agents_partial_images'].append(partial_views)
+        except Exception as e: pass # print(f"Warn: Init viz failed: {e}")
         return viz_data
 
-    def _visualize_frame(self, t, viz_data, action_dict, video_path):
-        """Create visualization for a single frame"""
-        plot_single_frame(
-            t, 
-            viz_data['full_images'][t], 
-            viz_data['agents_partial_images'][t], 
-            viz_data['actions'][t], 
-            viz_data['rewards'], 
-            action_dict, 
-            video_path, 
-            self.config.model_name,
-            predicted_actions=None
-        )
+    def add_visualization_data(self, viz_data, env, state, actions, next_state):
+        """Add data from one step to the visualization buffer"""
+        # Add actions
+        viz_data['actions'].append(actions)
+        
+        try:
+            # Add agent partial views
+            partial_views = []
+            for i in range(self.n_agents):
+                agent_state = self.get_agent_state(state, i)
+                if hasattr(env, 'get_obs_render') and agent_state and 'image' in agent_state:
+                    partial_views.append(env.get_obs_render(agent_state['image']))
+                else:
+                    # Placeholder for missing render
+                    partial_views.append(np.zeros((64, 64, 3), dtype=np.uint8))
+            
+            viz_data['agents_partial_images'].append(partial_views)
+            
+            # Add full environment image
+            if hasattr(env, 'render'):
+                viz_data['full_images'].append(env.render('rgb_array'))
+        except Exception as e:
+            # Silent fail to avoid disrupting episode
+            pass
+            
+        return viz_data
 
+    def visualize(self, env, mode, video_dir='videos', viz_data=None):
+        if not viz_data or not viz_data.get('rewards'): print("Error: No data for viz."); return
+        base_path = os.path.join(video_dir, self.config.experiment_name, self.config.model_name)
+        frame_path = os.path.join(base_path, mode + "_frames")
+        os.makedirs(frame_path, exist_ok=True)
+        action_dict = {act.value: act.name for act in env.Actions} if hasattr(env, 'Actions') else {i: f'act_{i}' for i in range(self.agents[0].action_space.n)}
+        traj_len = len(viz_data['rewards'])
+        print(f"Generating {traj_len} frames for video: {mode}")
+        for t in range(traj_len):
+            # Check data existence implicitly via list index access below
+            try:
+                 frame_file = os.path.join(frame_path, f'frame_{t:04d}.png')
+                 plot_single_frame(t, viz_data['full_images'][t], viz_data['agents_partial_images'][t],
+                                   viz_data['actions'][t], viz_data['rewards'], action_dict, frame_file, self.config.model_name)
+            except IndexError: print(f"Warn: Missing viz data at step {t}"); break # Stop if data missing
+            except Exception as e: print(f"Error plotting frame {t}: {e}")
+        video_filename = os.path.join(base_path, mode + '_trajectory')
+        try: make_video(frame_path, video_filename); print(f"Video saved: {video_filename}.mp4")
+        except Exception as e: print(f"Error creating video: {e}")
+
+    def get_agent_state(self, state_dict, agent_idx):
+        """Extract a single agent's observation from a multi-agent observation dict."""
+        if not isinstance(state_dict, dict):
+            return {}
+            
+        agent_state = {}
+        for key, val in state_dict.items():
+            try:
+                # Handle different possible formats for agent-specific data
+                if isinstance(val, (list, np.ndarray)) and len(val) > agent_idx:
+                    # Multi-agent data with shape [n_agents, ...]
+                    agent_state[key] = val[agent_idx]
+                elif hasattr(val, 'shape') and len(val.shape) > 0 and val.shape[0] > agent_idx:
+                    # Multi-agent tensor data
+                    agent_state[key] = val[agent_idx]
+                else:
+                    # Shared data or invalid format - use as is
+                    agent_state[key] = val
+            except Exception as e:
+                # If extraction fails, skip this key
+                pass
+        
+        return agent_state
+
+    def close_envs(self):
+        try: self.env.close() #; print("Base env closed.")
+        except Exception: pass
+        try: self.agents[0].env.close() #; print("Agent env closed.")
+        except Exception: pass
+
+# ==========================================================================
+# Notes on implementing CustomMultiGridPolicy
+# ==========================================================================
+"""
+Implementing CustomMultiGridPolicy is more complex and requires several additional components:
+
+1. **Custom Network Architecture**:
+   - Create a specialized CNN for processing small grid-world observations
+   - Implement custom feature extractors for multi-agent settings
+   - Handle both image observations and direction information
+
+2. **Observation Space Transformation**:
+   - Implement SingleAgentObsWrapper to extract individual agent observations
+   - Transform multi-agent observations (N, H, W, C) to single-agent (H, W, C)
+   - Handle direction and other observation components appropriately
+
+3. **Policy Implementation Flow**:
+   a. Import CustomMultiGridPolicy from networks.multigrid_network
+   b. Create separate environment wrappers for each agent using SingleAgentObsWrapper
+   c. Initialize PPO with CustomMultiGridPolicy and agent-specific environments
+   d. Configure policy_kwargs specifically for CustomMultiGridPolicy (kernel_size, fc_direction)
+   e. Implement fallback mechanisms in case the custom policy fails
+
+4. **Custom CNN Component**:
+   - Implement a CNN suitable for small (5x5) grid observations
+   - Handle various input formats and edge cases
+   - Process combined observations from image and direction inputs
+
+This approach provides more specialized handling of multi-agent grid environments
+but comes with potential implementation challenges.
+"""
