@@ -29,7 +29,12 @@ def make_env(config):
     if 'MultiGrid' in config.domain:
         from envs import gym_multigrid
         from envs.gym_multigrid import multigrid_envs
-        env = gym.make(config.domain)
+        if hasattr(config, 'n_agents'):
+            env = gym.make(config.domain, n_agents=config.n_agents)
+            print(f"Making MultiGrid env {config.domain} with n_agents={config.n_agents}")
+        else:
+            env = gym.make(config.domain)
+            print(f"Making MultiGrid env {config.domain} with default n_agents (n_agents not found in config)")
     else:
         raise NotImplementedError
     return env

@@ -1,5 +1,6 @@
 # MultiGrid Cluttered Parameters 
 domain: "MultiGrid-Cluttered-Fixed-15x15"
+n_agents: 4
 
 # MultiGrid-Cluttered-Fixed-Single-v0
 # MultiGrid-Cluttered-Fixed-15x15

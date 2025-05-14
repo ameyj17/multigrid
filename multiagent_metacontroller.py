@@ -93,7 +93,7 @@ class MultiAgentPPOController():
         self.model_others = config.get("model_others", False) 
 
         self.n_agents = env.n_agents
-        #print("Number of agents: ", self.n_agents)
+        print("Number of agents: ", self.n_agents)
 
         # Initialize PPO agents for each agent in the environment
         self.agents = [PPO("MultiInputPolicy", DiscreteActionWrapper(self.env), verbose=1, device=self.device)
